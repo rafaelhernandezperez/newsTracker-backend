@@ -5,9 +5,17 @@ const yf = new YahooFinance();
 
 export type MarketQuote = {
   symbol?: string;
+  currency?: string | null;
   price: number | null;
   change: number | null;
   volume: number | null;
+  marketCap: number | null;
+  trailingPE: number | null;
+  open: number | null;
+  dayHigh: number | null;
+  dayLow: number | null;
+  fiftyTwoWeekHigh: number | null;
+  fiftyTwoWeekLow: number | null;
 };
 
 export type MarketHistoryPoint = {
@@ -23,9 +31,17 @@ export async function getQuote(ticker: string) {
   const quote = await yf.quote(ticker);
   const result: MarketQuote = {
     symbol: quote.symbol,
+    currency: quote.currency ?? null,
     price: quote.regularMarketPrice ?? null,
     change: quote.regularMarketChangePercent ?? null,
     volume: quote.regularMarketVolume ?? null,
+    marketCap: quote.marketCap ?? null,
+    trailingPE: quote.trailingPE ?? null,
+    open: quote.regularMarketOpen ?? null,
+    dayHigh: quote.regularMarketDayHigh ?? null,
+    dayLow: quote.regularMarketDayLow ?? null,
+    fiftyTwoWeekHigh: quote.fiftyTwoWeekHigh ?? null,
+    fiftyTwoWeekLow: quote.fiftyTwoWeekLow ?? null,
   };
 
   return result;
