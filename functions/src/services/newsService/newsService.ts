@@ -1,5 +1,4 @@
 // WebScrapping
-import axios from 'axios';
 import Parser from 'rss-parser';
 import { FEED_SOURCES } from './sources';
 import { buildCompanyProfile } from './companyResolver';
@@ -36,26 +35,6 @@ type FeedItem = {
 type ResolvedDateRange = {
   from?: Date;
   to?: Date;
-};
-
-type AlphaVantageTickerSentiment = {
-  ticker?: string;
-};
-
-type AlphaVantageFeedItem = {
-  title?: string;
-  summary?: string;
-  url?: string;
-  time_published?: string;
-  source?: string;
-  ticker_sentiment?: AlphaVantageTickerSentiment[];
-};
-
-type AlphaVantageResponse = {
-  feed?: AlphaVantageFeedItem[];
-  Information?: string;
-  Note?: string;
-  'Error Message'?: string;
 };
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
@@ -160,43 +139,6 @@ function isWithinDateRange(item: NewsItem, range: ResolvedDateRange): boolean {
   return true;
 }
 
-function formatAlphaVantageDate(value?: string): string | undefined {
-  if (!value) {
-    return undefined;
-  }
-
-  const match = value.match(
-    /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})?$/
-  );
-
-  if (!match) {
-    return undefined;
-  }
-
-  const [, year, month, day, hour, minute, second = '00'] = match;
-
-  return new Date(
-    Date.UTC(
-      Number(year),
-      Number(month) - 1,
-      Number(day),
-      Number(hour),
-      Number(minute),
-      Number(second)
-    )
-  ).toISOString();
-}
-
-function formatAlphaVantageQueryDate(date: Date): string {
-  const year = date.getUTCFullYear().toString().padStart(4, '0');
-  const month = (date.getUTCMonth() + 1).toString().padStart(2, '0');
-  const day = date.getUTCDate().toString().padStart(2, '0');
-  const hour = date.getUTCHours().toString().padStart(2, '0');
-  const minute = date.getUTCMinutes().toString().padStart(2, '0');
-
-  return `${year}${month}${day}T${hour}${minute}`;
-}
-
 async function fetchRssNewsForTicker(
   profile: ReturnType<typeof buildCompanyProfile>
 ): Promise<NewsItem[]> {
@@ -247,87 +189,6 @@ async function fetchRssNewsForTicker(
   return allResults.flat();
 }
 
-async function fetchHistoricalNewsForTicker(
-  profile: ReturnType<typeof buildCompanyProfile>,
-  limit: number,
-  minScore: number,
-  dateRange: ResolvedDateRange
-): Promise<NewsItem[]> {
-  if (!dateRange.from) {
-    return [];
-  }
-
-  const apiKey = process.env.ALPHAVANTAGE_API_KEY?.trim();
-  if (!apiKey) {
-    console.warn(
-      '[newsService] ALPHAVANTAGE_API_KEY is not configured. Historical news lookback is limited to RSS feed retention.'
-    );
-    return [];
-  }
-
-  try {
-    const response = await axios.get<AlphaVantageResponse>(
-      'https://www.alphavantage.co/query',
-      {
-        params: {
-          function: 'NEWS_SENTIMENT',
-          tickers: profile.ticker,
-          time_from: formatAlphaVantageQueryDate(dateRange.from),
-          time_to: dateRange.to ? formatAlphaVantageQueryDate(dateRange.to) : undefined,
-          limit: Math.min(Math.max(limit * 5, 100), 1000),
-          sort: 'LATEST',
-          apikey: apiKey,
-        },
-        timeout: 10000,
-      }
-    );
-
-    if (response.data['Error Message'] || response.data.Note || response.data.Information) {
-      console.warn(
-        '[newsService] Historical news provider response:',
-        response.data['Error Message'] ||
-          response.data.Note ||
-          response.data.Information
-      );
-      return [];
-    }
-
-    return (response.data.feed ?? []).map((item) => {
-      const title = item.title?.trim() ?? '';
-      const summary = item.summary?.trim() ?? '';
-      const link = item.url?.trim() ?? '';
-      const isoDate = formatAlphaVantageDate(item.time_published);
-      const matchedByProvider = (item.ticker_sentiment ?? []).some(
-        (entry) => entry.ticker?.toUpperCase() === profile.ticker
-      );
-      const aliasMatches = countMatches(`${title} ${summary}`, profile.aliases);
-      const relevanceScore = calculateRelevanceScore(
-        title,
-        summary,
-        profile.aliases,
-        profile.ticker
-      );
-      const score = matchedByProvider ? Math.max(relevanceScore, minScore) : relevanceScore;
-
-      return {
-        id: createNewsId(item.source?.trim() ?? 'Alpha Vantage', link, title),
-        title,
-        link,
-        source: item.source?.trim() || 'Alpha Vantage',
-        summary,
-        pubDate: isoDate,
-        isoDate,
-        matchedTickers:
-          matchedByProvider || aliasMatches.length > 0 ? [profile.ticker] : [],
-        score,
-      };
-    });
-  } catch (error) {
-    console.error('[newsService] Historical news provider error:', error);
-    return [];
-  }
-}
-
 export async function fetchNewsForTicker(
   ticker: string,
   options: FetchNewsOptions = {}
@@ -337,16 +198,9 @@ export async function fetchNewsForTicker(
   const profile = buildCompanyProfile(ticker, companyName);
   const dateRange = resolveDateRange(options);
 
-  const [rssNews, historicalNews] = await Promise.all(
-    [
-      fetchRssNewsForTicker(profile),
-      fetchHistoricalNewsForTicker(profile, limit, minScore, dateRange),
-    ]
-  );
+  const rssNews = await fetchRssNewsForTicker(profile);
 
-  const allNews = [...rssNews, ...historicalNews];
-
-  const filtered = allNews.filter(
+  const filtered = rssNews.filter(
     (item: NewsItem) =>
       item.link &&
       item.title &&
