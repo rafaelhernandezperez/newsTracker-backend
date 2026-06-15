@@ -6,6 +6,7 @@ import newsRouter from "./routes/news.js";
 import marketRouter from "./routes/market.js";
 import tickersRouter from "./routes/tickers.js";
 import watchlistRouter from "./routes/watchlist.js";
+import devicesRouter from "./routes/devices.js";
 
 const app = express();
 
@@ -16,6 +17,7 @@ app.use("/news", newsRouter);
 app.use("/market", marketRouter);
 app.use("/tickers", tickersRouter);
 app.use("/watchlist", watchlistRouter);
+app.use("/devices", devicesRouter);
 
 app.use((err: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
   console.error("[Express Error]", err);
@@ -31,5 +33,8 @@ export const api = onRequest(
   },
   app
 );
+
+// Scheduled functions (Cloud Scheduler): 15-min news store + daily user digest.
+export { trackNews, dailyDigest } from "./scheduler/index.js";
 
 export default app;

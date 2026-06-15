@@ -1,6 +1,7 @@
 //GET /news/:ticker
 import { Router, type Request, type Response } from 'express';
 import { fetchNewsForTicker } from '../services/newsService/newsService';
+import { getStoredNews } from '../services/firebaseService/firebaseService';
 
 const router = Router();
 
@@ -15,6 +16,25 @@ function getQueryString(value: unknown): string | undefined {
 
   return undefined;
 }
+
+// GET /news/:ticker/stored - AI-enriched news persisted by the tracker pipeline
+router.get('/:ticker/stored', async (req: Request, res: Response) => {
+  try {
+    const { ticker } = req.params;
+    const rawLimit = getQueryString(req.query.limit);
+    const parsedLimit = rawLimit ? Number(rawLimit) : undefined;
+    const limit =
+      typeof parsedLimit === 'number' && Number.isFinite(parsedLimit) && parsedLimit > 0
+        ? Math.min(Math.floor(parsedLimit), 100)
+        : 30;
+
+    const items = await getStoredNews(ticker, limit);
+    return res.json({ ok: true, ticker: ticker.toUpperCase(), count: items.length, items });
+  } catch (error) {
+    console.error('[routes/news] stored error:', error);
+    return res.status(500).json({ ok: false, message: 'Error fetching stored news' });
+  }
+});
 
 router.get('/:ticker', async (req: Request, res: Response) => {
   try {
@@ -50,6 +70,9 @@ router.get('/:ticker', async (req: Request, res: Response) => {
       from,
       to,
       daysBack,
+      // Attach AI importance + sentiment so the frontend chart can size/color
+      // its news markers. Cached per item, so repeat requests stay cheap.
+      enrich: true,
     });
 
     return res.json({

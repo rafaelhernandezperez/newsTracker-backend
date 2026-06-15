@@ -16,6 +16,17 @@ service cloud.firestore {
       match /watchlist/{ticker} {
         allow read, create, update, delete: if isOwner(userId);
       }
+
+      match /devices/{token} {
+        allow read, create, update, delete: if isOwner(userId);
+      }
+    }
+
+    // News is written only by the backend (Admin SDK bypasses rules).
+    // Clients may read; no client writes.
+    match /news/{newsId} {
+      allow read: if isSignedIn();
+      allow write: if false;
     }
   }
 }

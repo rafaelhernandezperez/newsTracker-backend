@@ -18,6 +18,16 @@ export function createNewsId(source: string, link: string, title: string): strin
     .slice(0, 24);
 }
 
+/**
+ * Stable, source-independent id for an article, so the SAME story collapses
+ * to one document across feeds and across scheduler runs (used as the Firestore
+ * doc id for persistence/dedup). Based on the canonical link, falling back to title.
+ */
+export function stableNewsKey(link?: string, title?: string): string {
+  const canonical = normalizeText(link?.trim() || title || '');
+  return crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 32);
+}
+
 export function dedupeNews(items: NewsItem[]): NewsItem[] {
   const map = new Map<string, NewsItem>();
 
