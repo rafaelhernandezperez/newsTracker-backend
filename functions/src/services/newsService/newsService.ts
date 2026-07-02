@@ -1,11 +1,16 @@
 import Parser from 'rss-parser';
 import axios from 'axios';
-import { QUERY_SOURCES } from './sources';
+import YahooFinance from 'yahoo-finance2';
+import {
+  GOOGLE_EDITIONS,
+  googleNewsHistoricalUrl,
+  QUERY_SOURCES,
+} from './sources';
 import { resolveCompanyProfile } from './companyResolver';
 import { calculateRelevanceScore, financialSignal } from './relevance';
 import { createNewsId, dedupeNews } from './normalizers';
 import { TtlCache } from './cache';
-import { enrichNews } from '../aiService/aiService';
+import { enrichNewsBatch } from '../aiService/aiService';
 import type { CompanyProfile, NewsItem } from './types';
 
 const parser = new Parser({
@@ -16,27 +21,34 @@ const parser = new Parser({
   },
 });
 
+const yf = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
+
 // Per-ticker results are cached briefly so the on-demand API and the scheduler
 // don't hammer the same feeds repeatedly.
 const newsCache = new TtlCache<NewsItem[]>(5 * 60 * 1000);
 
-// Historical company news (Finnhub), cached per ticker + date window. This is the
-// source that actually carries OLD-dated stories, so the frontend can spread its
-// chart markers across real publish dates instead of clustering on "today".
-const historicalCache = new TtlCache<NewsItem[]>(30 * 60 * 1000);
+// Historical company news (Finnhub), cached per ticker + date window. This is a
+// source that carries OLD-dated stories, so the frontend can spread its chart
+// markers across real publish dates instead of clustering on "today".
+const finnhubCache = new TtlCache<NewsItem[]>(30 * 60 * 1000);
 const FINNHUB_COMPANY_NEWS_URL = 'https://finnhub.io/api/v1/company-news';
+
+// Historical Google News windows are immutable once the window is in the past,
+// so they can be cached much longer than the live feeds.
+const googleHistoryCache = new TtlCache<NewsItem[]>(12 * 60 * 60 * 1000);
 
 // AI classification of a given story is stable, so it's cached far longer than
 // the feed results and keyed by the item's stable id. This keeps repeated
-// on-demand requests cheap and bounds Hugging Face calls.
+// on-demand requests cheap and bounds LLM calls.
 const enrichmentCache = new TtlCache<{
   importance: NonNullable<NewsItem['importance']>;
   sentiment: NonNullable<NewsItem['sentiment']>;
+  aiSummary?: string;
 }>(6 * 60 * 60 * 1000);
 
-// Bound how many items we send to the LLM per request so the on-demand endpoint
-// stays responsive even when a feed returns a large batch.
-const MAX_ENRICH_PER_REQUEST = 25;
+// Bound how many items we send to the LLM per request. Classification is
+// batched (several items per call), so this stays responsive even at 40.
+const MAX_ENRICH_PER_REQUEST = 40;
 
 type FetchNewsOptions = {
   companyName?: string;
@@ -52,28 +64,37 @@ type FetchNewsOptions = {
 };
 
 /**
- * Attach AI importance + sentiment to each item, in parallel and cached by id.
- * On any failure the item is returned unchanged (markers then fall back to a
- * neutral size/color on the frontend).
+ * Attach AI importance + sentiment + summary to each item. Cached per item id;
+ * uncached items are classified in batched LLM calls. On failure items are
+ * returned unchanged (markers then fall back to a neutral size/color).
  */
 export async function enrichNewsItems(items: NewsItem[]): Promise<NewsItem[]> {
-  return Promise.all(
-    items.map(async (item) => {
-      try {
-        const enrichment = await enrichmentCache.getOrSet(item.id, async () => {
-          const result = await enrichNews(
-            `${item.title}. ${item.summary ?? ''}`,
-            item.summary ?? ''
-          );
-          return { importance: result.importance, sentiment: result.sentiment };
+  const pending = items.filter((item) => !enrichmentCache.get(item.id));
+
+  if (pending.length > 0) {
+    try {
+      const enrichments = await enrichNewsBatch(
+        pending.map((item) => ({
+          text: `${item.title}. ${item.summary ?? ''}`,
+          fallbackSummary: item.summary ?? '',
+        }))
+      );
+      enrichments.forEach((enrichment, i) => {
+        enrichmentCache.set(pending[i].id, {
+          importance: enrichment.importance,
+          sentiment: enrichment.sentiment,
+          aiSummary: enrichment.summary || undefined,
         });
-        return { ...item, ...enrichment };
-      } catch (error) {
-        console.warn(`[newsService] enrichment failed for ${item.id}:`, error);
-        return item;
-      }
-    })
-  );
+      });
+    } catch (error) {
+      console.warn('[newsService] batch enrichment failed:', error);
+    }
+  }
+
+  return items.map((item) => {
+    const enrichment = enrichmentCache.get(item.id);
+    return enrichment ? { ...item, ...enrichment } : item;
+  });
 }
 
 type FeedItem = {
@@ -165,46 +186,92 @@ function cleanTitle(title: string): string {
   return title.replace(/\s+-\s+[^-]+$/, '').trim() || title.trim();
 }
 
+type ScoredItemInput = {
+  profile: CompanyProfile;
+  sourceName: string;
+  language: string;
+  title: string;
+  summary: string;
+  link: string;
+  pubDate?: string;
+  isoDate?: string;
+  /**
+   * True when the source is a literal per-company query (search feed, Finnhub
+   * company-news, Yahoo ticker search): provenance alone is evidence of
+   * relevance, so those items get base credit on top of keyword matching.
+   */
+  searchProvenance: boolean;
+};
+
+/** Score + assemble a NewsItem the same way for every source. */
+function buildScoredItem(input: ScoredItemInput): NewsItem | null {
+  const title = cleanTitle(input.title.trim());
+  const link = input.link.trim();
+  if (!title || !link) return null;
+
+  const keywordScore = calculateRelevanceScore(
+    title,
+    input.summary,
+    input.profile.aliases,
+    input.profile.ticker
+  );
+  const base = input.searchProvenance ? keywordScore + 2 : keywordScore;
+  // Bias toward financial coverage and away from sponsorship/sports/CSR
+  // brand mentions that merely carry the company name.
+  const signal = financialSignal(title, input.summary);
+
+  return {
+    id: createNewsId(input.sourceName, link, title),
+    title,
+    link,
+    source: input.sourceName,
+    summary: input.summary,
+    pubDate: input.pubDate,
+    isoDate: input.isoDate,
+    language: input.language,
+    matchedTickers: [input.profile.ticker],
+    score: base + signal.delta,
+    isFinancial: signal.isFinancial,
+  };
+}
+
+function mapFeedItems(
+  items: FeedItem[],
+  profile: CompanyProfile,
+  sourceName: string,
+  language: string,
+  searchProvenance: boolean
+): NewsItem[] {
+  return items
+    .map((item) =>
+      buildScoredItem({
+        profile,
+        sourceName,
+        language,
+        title: item.title ?? '',
+        summary: item.contentSnippet?.trim() || item.content?.trim() || '',
+        link: item.link ?? '',
+        pubDate: item.pubDate,
+        isoDate: item.isoDate,
+        searchProvenance,
+      })
+    )
+    .filter((item): item is NewsItem => item !== null);
+}
+
 async function fetchFromQuerySources(profile: CompanyProfile): Promise<NewsItem[]> {
   const results = await Promise.all(
     QUERY_SOURCES.map(async (source) => {
       const url = source.build(profile);
       try {
         const feed = await parser.parseURL(url);
-        return (feed.items ?? []).map((item: FeedItem): NewsItem => {
-          const title = cleanTitle(item.title?.trim() ?? '');
-          const summary = item.contentSnippet?.trim() || item.content?.trim() || '';
-          const link = item.link?.trim() ?? '';
-
-          const keywordScore = calculateRelevanceScore(
-            title,
-            summary,
-            profile.aliases,
-            profile.ticker
-          );
-          // 'search' sources are a literal per-company query, so provenance alone
-          // is evidence of relevance (base credit). 'feed' sources may pad with
-          // general market stories, so they must earn it via keyword matching.
-          const base = source.kind === 'search' ? keywordScore + 2 : keywordScore;
-          // Bias toward financial coverage and away from sponsorship/sports/CSR
-          // brand mentions that merely carry the company name.
-          const signal = financialSignal(title, summary);
-          const score = base + signal.delta;
-
-          return {
-            id: createNewsId(source.name, link, title),
-            title,
-            link,
-            source: source.name,
-            summary,
-            pubDate: item.pubDate,
-            isoDate: item.isoDate,
-            language: source.language,
-            matchedTickers: [profile.ticker],
-            score,
-            isFinancial: signal.isFinancial,
-          };
-        });
+        return mapFeedItems(
+          feed.items ?? [],
+          profile,
+          source.name,
+          source.language,
+          source.kind === 'search'
+        );
       } catch (error) {
         console.error(`[newsService] Feed error (${source.name}) for ${profile.ticker}:`, error);
         return [] as NewsItem[];
@@ -213,6 +280,55 @@ async function fetchFromQuerySources(profile: CompanyProfile): Promise<NewsItem[
   );
 
   return results.flat();
+}
+
+type YahooSearchNews = {
+  title?: string;
+  link?: string;
+  publisher?: string;
+  providerPublishTime?: Date | number;
+};
+
+/**
+ * Yahoo Finance ticker search news (yahoo-finance2). Keyless, ticker-scoped,
+ * dated, and publisher-attributed — a solid complement to the RSS feeds.
+ */
+async function fetchYahooSearchNews(profile: CompanyProfile): Promise<NewsItem[]> {
+  try {
+    // validateResult:false loosens the return type; cast to the fields we read.
+    const result = (await yf.search(
+      profile.ticker,
+      { newsCount: 12, quotesCount: 1 },
+      { validateResult: false }
+    )) as { news?: YahooSearchNews[] };
+    const news: YahooSearchNews[] = Array.isArray(result?.news) ? result.news : [];
+
+    return news
+      .map((article) => {
+        const publishedAt =
+          article.providerPublishTime instanceof Date
+            ? article.providerPublishTime.toISOString()
+            : typeof article.providerPublishTime === 'number'
+              ? new Date(article.providerPublishTime * 1000).toISOString()
+              : undefined;
+
+        return buildScoredItem({
+          profile,
+          sourceName: `Yahoo Finance${article.publisher ? ` · ${article.publisher}` : ''}`,
+          language: 'en',
+          title: article.title ?? '',
+          summary: '',
+          link: article.link ?? '',
+          pubDate: publishedAt,
+          isoDate: publishedAt,
+          searchProvenance: true,
+        });
+      })
+      .filter((item): item is NewsItem => item !== null);
+  } catch (error) {
+    console.error(`[newsService] Yahoo search error for ${profile.ticker}:`, error);
+    return [];
+  }
 }
 
 type FinnhubArticle = {
@@ -248,7 +364,7 @@ async function fetchFinnhubNews(
   const from = range.from ?? new Date(to.getTime() - 90 * ONE_DAY_MS);
   const cacheKey = `${profile.ticker}|${toYmd(from)}|${toYmd(to)}`;
 
-  return historicalCache.getOrSet(cacheKey, async () => {
+  return finnhubCache.getOrSet(cacheKey, async () => {
     try {
       const response = await axios.get<FinnhubArticle[]>(FINNHUB_COMPANY_NEWS_URL, {
         params: { symbol: profile.ticker, from: toYmd(from), to: toYmd(to), token },
@@ -258,39 +374,20 @@ async function fetchFinnhubNews(
       const articles = Array.isArray(response.data) ? response.data : [];
       return articles
         .map((article): NewsItem | null => {
-          const title = article.headline?.trim() ?? '';
-          const link = article.url?.trim() ?? '';
-          if (!title || !link || !article.datetime) {
-            return null;
-          }
-
-          const summary = article.summary?.trim() ?? '';
+          if (!article.datetime) return null;
           const publishedAt = new Date(article.datetime * 1000).toISOString();
-          const sourceName = `Finnhub${article.source ? ` · ${article.source}` : ''}`;
 
-          // Finnhub company-news is already ticker-scoped (like a 'search'
-          // source), so provenance earns base credit just like Google search.
-          const keywordScore = calculateRelevanceScore(
-            title,
-            summary,
-            profile.aliases,
-            profile.ticker
-          );
-          const signal = financialSignal(title, summary);
-
-          return {
-            id: createNewsId('Finnhub', link, title),
-            title,
-            link,
-            source: sourceName,
-            summary,
+          return buildScoredItem({
+            profile,
+            sourceName: `Finnhub${article.source ? ` · ${article.source}` : ''}`,
+            language: 'en',
+            title: article.headline ?? '',
+            summary: article.summary?.trim() ?? '',
+            link: article.url ?? '',
             pubDate: publishedAt,
             isoDate: publishedAt,
-            language: 'en',
-            matchedTickers: [profile.ticker],
-            score: keywordScore + 2 + signal.delta,
-            isFinancial: signal.isFinancial,
-          };
+            searchProvenance: true,
+          });
         })
         .filter((item): item is NewsItem => item !== null);
     } catch (error) {
@@ -298,6 +395,118 @@ async function fetchFinnhubNews(
       return [];
     }
   });
+}
+
+// Ranges shorter than this are covered by the live feeds; no backfill needed.
+const HISTORY_MIN_DAYS = 14;
+// Bound the number of date windows per edition so a cold 1Y request stays fast.
+const HISTORY_MAX_WINDOWS = 4;
+
+/**
+ * Historical Google News coverage: split the requested range into a few date
+ * windows and query each with `after:`/`before:`. Keyless, and each window
+ * returns up to ~100 stories dated INSIDE the window, so long chart ranges get
+ * markers spread across their real publish dates. Windows are cached 12h.
+ */
+async function fetchHistoricalGoogleNews(
+  profile: CompanyProfile,
+  range: ResolvedDateRange
+): Promise<NewsItem[]> {
+  const { from } = range;
+  const to = range.to ?? new Date();
+  if (!from) return [];
+
+  const totalDays = (to.getTime() - from.getTime()) / ONE_DAY_MS;
+  if (totalDays <= HISTORY_MIN_DAYS) return [];
+
+  const windowCount = Math.min(HISTORY_MAX_WINDOWS, Math.ceil(totalDays / 45));
+  const windowMs = (to.getTime() - from.getTime()) / windowCount;
+
+  const jobs: Promise<NewsItem[]>[] = [];
+  for (let i = 0; i < windowCount; i++) {
+    const windowFrom = new Date(from.getTime() + i * windowMs);
+    const windowTo = new Date(from.getTime() + (i + 1) * windowMs);
+
+    for (const edition of GOOGLE_EDITIONS) {
+      const cacheKey = `${profile.ticker}|${edition.language}|${toYmd(windowFrom)}|${toYmd(windowTo)}`;
+      jobs.push(
+        googleHistoryCache.getOrSet(cacheKey, async () => {
+          try {
+            const url = googleNewsHistoricalUrl(profile, edition, toYmd(windowFrom), toYmd(windowTo));
+            const feed = await parser.parseURL(url);
+            return mapFeedItems(feed.items ?? [], profile, edition.name, edition.language, true);
+          } catch (error) {
+            console.error(
+              `[newsService] Google history error (${edition.language} ${toYmd(windowFrom)}..${toYmd(windowTo)}) for ${profile.ticker}:`,
+              error
+            );
+            return [];
+          }
+        })
+      );
+    }
+  }
+
+  return (await Promise.all(jobs)).flat();
+}
+
+/**
+ * Pick up to `limit` items SPREAD across the requested date range instead of
+ * just the newest ones. Without this, historical coverage gets crowded out on
+ * long timeframes and the chart markers all cluster on the most recent days.
+ * Buckets the range, takes the best-scored story per bucket round-robin, and
+ * returns the selection newest-first.
+ */
+function selectSpreadAcrossRange(
+  items: NewsItem[],
+  range: ResolvedDateRange,
+  limit: number
+): NewsItem[] {
+  const byDateDesc = (a: NewsItem, b: NewsItem): number => {
+    const dateA = toTimestamp(a.isoDate ?? a.pubDate);
+    const dateB = toTimestamp(b.isoDate ?? b.pubDate);
+    if (dateB !== dateA) return dateB - dateA;
+    return b.score - a.score;
+  };
+
+  const { from } = range;
+  const to = range.to ?? new Date();
+  const totalDays = from ? (to.getTime() - from.getTime()) / ONE_DAY_MS : 0;
+
+  if (!from || totalDays <= HISTORY_MIN_DAYS || items.length <= limit) {
+    return [...items].sort(byDateDesc).slice(0, limit);
+  }
+
+  const bucketCount = Math.min(limit, Math.ceil(totalDays));
+  const bucketMs = (to.getTime() - from.getTime()) / bucketCount;
+
+  const buckets = new Map<number, NewsItem[]>();
+  for (const item of items) {
+    const ts = toTimestamp(item.isoDate ?? item.pubDate);
+    const index = Math.min(bucketCount - 1, Math.max(0, Math.floor((ts - from.getTime()) / bucketMs)));
+    const bucket = buckets.get(index) ?? [];
+    bucket.push(item);
+    buckets.set(index, bucket);
+  }
+  // Best story first within each bucket (score, then recency).
+  for (const bucket of buckets.values()) {
+    bucket.sort((a, b) => b.score - a.score || byDateDesc(a, b));
+  }
+
+  const ordered = [...buckets.entries()].sort(([a], [b]) => a - b).map(([, bucket]) => bucket);
+  const selected: NewsItem[] = [];
+  for (let round = 0; selected.length < limit; round++) {
+    let took = false;
+    for (const bucket of ordered) {
+      if (round < bucket.length && selected.length < limit) {
+        selected.push(bucket[round]);
+        took = true;
+      }
+    }
+    if (!took) break;
+  }
+
+  return selected.sort(byDateDesc);
 }
 
 export async function fetchNewsForTicker(
@@ -312,14 +521,18 @@ export async function fetchNewsForTicker(
   const profile = await resolveCompanyProfile(ticker, companyName);
   const dateRange = resolveDateRange(options);
 
-  const cacheKey = `${profile.ticker}|${profile.companyName}`;
-  // Recent RSS coverage + dated historical coverage, fetched in parallel.
-  const [rssNews, historicalNews] = await Promise.all([
-    newsCache.getOrSet(cacheKey, () => fetchFromQuerySources(profile)),
+  // Recent coverage (RSS + Yahoo search) and dated historical coverage
+  // (Google News date windows + Finnhub), all fetched in parallel.
+  const [rssNews, yahooNews, googleHistory, finnhubNews] = await Promise.all([
+    newsCache.getOrSet(`rss|${profile.ticker}|${profile.companyName}`, () =>
+      fetchFromQuerySources(profile)
+    ),
+    newsCache.getOrSet(`yahoo|${profile.ticker}`, () => fetchYahooSearchNews(profile)),
+    fetchHistoricalGoogleNews(profile, dateRange),
     fetchFinnhubNews(profile, dateRange),
   ]);
 
-  const filtered = [...rssNews, ...historicalNews].filter(
+  const filtered = [...rssNews, ...yahooNews, ...googleHistory, ...finnhubNews].filter(
     (item) =>
       item.link &&
       item.title &&
@@ -329,15 +542,7 @@ export async function fetchNewsForTicker(
   );
 
   const deduped = dedupeNews(filtered);
-
-  const sorted = deduped.sort((a, b) => {
-    const dateA = toTimestamp(a.isoDate ?? a.pubDate);
-    const dateB = toTimestamp(b.isoDate ?? b.pubDate);
-    if (dateB !== dateA) return dateB - dateA;
-    return b.score - a.score;
-  });
-
-  const top = sorted.slice(0, limit);
+  const top = selectSpreadAcrossRange(deduped, dateRange, limit);
 
   if (enrich) {
     // Enrich the freshest slice with AI; return the rest unchanged so longer

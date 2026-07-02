@@ -1,7 +1,16 @@
-import axios from 'axios';
+import axios, { AxiosError } from 'axios';
 
 const HUGGING_FACE_CHAT_URL = 'https://router.huggingface.co/v1/chat/completions';
-const DEFAULT_MODEL = 'mistralai/Mixtral-8x7B-Instruct-v0.1:fastest';
+
+/**
+ * Primary model: Llama 3.3 70B Instruct — strong instruction-following and
+ * reliable JSON output, widely provisioned across HF inference providers.
+ * Override with HF_MODEL. If the primary is unavailable (404/403 for the model,
+ * provider outage), the fallback is tried before giving up.
+ */
+const DEFAULT_MODEL = 'meta-llama/Llama-3.3-70B-Instruct';
+const FALLBACK_MODEL = 'Qwen/Qwen2.5-72B-Instruct';
+
 const SENTIMENT_VALUES = ['POSITIVO', 'NEGATIVO', 'NEUTRO'] as const;
 const IMPORTANCE_VALUES = [
   'MUY_IMPORTANTE',
@@ -30,19 +39,28 @@ function getHuggingFaceToken(): string {
   return token;
 }
 
-async function runPrompt(prompt: string, maxTokens: number): Promise<string> {
+function isRetryable(error: unknown): boolean {
+  const status = (error as AxiosError)?.response?.status;
+  // Retry on rate limits, provider hiccups, and network-level failures.
+  return status === undefined || status === 429 || status >= 500;
+}
+
+async function callModel(model: string, prompt: string, maxTokens: number): Promise<string> {
   const response = await axios.post<HuggingFaceChatResponse>(
     HUGGING_FACE_CHAT_URL,
     {
-      model: process.env.HF_MODEL?.trim() || DEFAULT_MODEL,
+      model,
       messages: [
         {
-          role: 'user',
-          content: prompt,
+          role: 'system',
+          content:
+            'Eres un analista financiero senior. Clasificas noticias para inversores ' +
+            'particulares. Respondes SIEMPRE con JSON valido y nada mas.',
         },
+        { role: 'user', content: prompt },
       ],
       max_tokens: maxTokens,
-      temperature: 0.2,
+      temperature: 0.1,
       stream: false,
     },
     {
@@ -50,7 +68,7 @@ async function runPrompt(prompt: string, maxTokens: number): Promise<string> {
         Authorization: `Bearer ${getHuggingFaceToken()}`,
         'Content-Type': 'application/json',
       },
-      timeout: 30000,
+      timeout: 45000,
     }
   );
 
@@ -62,17 +80,41 @@ async function runPrompt(prompt: string, maxTokens: number): Promise<string> {
   return content;
 }
 
-export async function summarize(text: string): Promise<string> {
-  return runPrompt(
-    `Resume en una frase en español esta noticia financiera. Solo la frase, sin explicaciones: ${text}`,
-    80
-  );
+/**
+ * Run a prompt against the configured model with one retry on transient errors,
+ * then against the fallback model before giving up.
+ */
+async function runPrompt(prompt: string, maxTokens: number): Promise<string> {
+  const primary = process.env.HF_MODEL?.trim() || DEFAULT_MODEL;
+  const models = primary === FALLBACK_MODEL ? [primary] : [primary, FALLBACK_MODEL];
+
+  let lastError: unknown;
+  for (const model of models) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        return await callModel(model, prompt, maxTokens);
+      } catch (error) {
+        lastError = error;
+        if (!isRetryable(error)) break; // model/auth problem: skip to fallback model
+        await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+      }
+    }
+  }
+
+  throw lastError;
 }
 
 export type NewsEnrichment = {
   summary: string;
   sentiment: Sentiment;
   importance: Importance;
+};
+
+export type EnrichmentInput = {
+  /** Headline + snippet handed to the model. */
+  text: string;
+  /** Used when the model produces no usable summary for this item. */
+  fallbackSummary?: string;
 };
 
 /** Normalize a raw model string to one of the allowed enum values. */
@@ -86,70 +128,118 @@ function coerceEnum<T extends string>(
 }
 
 /**
- * Summarize, classify market IMPORTANCE, and classify SENTIMENT in a SINGLE LLM
- * call. Used by the scheduler (many items per run) and the on-demand news API,
- * so folding three signals into one call matters for latency and rate limits.
- * Returns a safe fallback if parsing fails.
- *
- * IMPORTANCIA drives the size of the chart marker on the frontend; SENTIMIENTO
- * drives its color.
+ * Explicit rubric so classifications are consistent run-to-run instead of
+ * depending on the model's own notion of "important". IMPORTANCIA drives the
+ * chart marker SIZE on the frontend; SENTIMIENTO drives its COLOR.
  */
-export async function enrichNews(text: string, fallbackSummary = ''): Promise<NewsEnrichment> {
-  try {
-    const raw = await runPrompt(
-      'Eres un analista financiero. Analiza la noticia y devuelve SOLO un objeto JSON valido ' +
-        'con esta forma exacta, sin texto adicional:\n' +
-        '{"summary": "<resumen en una frase en español>", ' +
-        '"importancia": "MUY_IMPORTANTE|IMPORTANTE|NEUTRO|POCO_RELEVANTE", ' +
-        '"sentimiento": "POSITIVO|NEGATIVO|NEUTRO"}\n' +
-        'La "importancia" mide el impacto potencial de la noticia en el mercado o en la ' +
-        'cotizacion de la empresa. El "sentimiento" mide el tono para el inversor. Noticia: ' +
-        text,
-      200
-    );
+const CLASSIFICATION_RUBRIC =
+  'Para cada noticia devuelve:\n' +
+  '- "summary": resumen de UNA frase en español (max 30 palabras).\n' +
+  '- "importancia", segun el impacto potencial en la cotizacion de la empresa:\n' +
+  '  * MUY_IMPORTANTE: resultados trimestrales/anuales, fusiones/adquisiciones/OPA, ' +
+  'profit warning, cambio de guidance, sancion o fallo regulatorio/judicial relevante, ' +
+  'cambio de CEO/CFO, ampliacion de capital, recorte o subida de dividendo, quiebra.\n' +
+  '  * IMPORTANTE: mejora/rebaja de recomendacion o precio objetivo de analistas, ' +
+  'contrato o producto significativo, movimiento brusco de la cotizacion, cambios ' +
+  'estrategicos concretos.\n' +
+  '  * NEUTRO: cobertura general, la empresa aparece junto a otras, analisis sin novedad.\n' +
+  '  * POCO_RELEVANTE: patrocinios, RSC, marca, listas genericas, contenido promocional.\n' +
+  '- "sentimiento": efecto esperado para el accionista: POSITIVO, NEGATIVO o NEUTRO.\n';
 
-    const match = raw.match(/\{[\s\S]*\}/);
-    if (match) {
-      const parsed = JSON.parse(match[0]) as {
-        summary?: string;
-        importancia?: string;
-        sentimiento?: string;
-        // Tolerate English keys in case the model ignores the schema.
-        importance?: string;
-        sentiment?: string;
-      };
-      return {
-        summary: parsed.summary?.trim() || fallbackSummary,
-        importance: coerceEnum(
-          parsed.importancia ?? parsed.importance,
-          IMPORTANCE_VALUES,
-          'NEUTRO'
-        ),
-        sentiment: coerceEnum(
-          parsed.sentimiento ?? parsed.sentiment,
-          SENTIMENT_VALUES,
-          'NEUTRO'
-        ),
-      };
-    }
-  } catch (error) {
-    console.warn('[aiService] enrichNews failed, using fallback:', error);
-  }
-
+function neutralEnrichment(fallbackSummary = ''): NewsEnrichment {
   return { summary: fallbackSummary, sentiment: 'NEUTRO', importance: 'NEUTRO' };
 }
 
-export async function analyzeSentiment(text: string): Promise<Sentiment> {
-  const result = (
-    await runPrompt(
-      `Responde SOLO con una palabra: POSITIVO, NEGATIVO o NEUTRO según el tono de esta noticia financiera: ${text}`,
-      8
-    )
-  ).toUpperCase().replace(/[^A-ZÁÉÍÓÚÑ]/g, '');
+function parseEnrichment(
+  parsed: {
+    summary?: string;
+    importancia?: string;
+    sentimiento?: string;
+    // Tolerate English keys in case the model ignores the schema.
+    importance?: string;
+    sentiment?: string;
+  },
+  fallbackSummary: string
+): NewsEnrichment {
+  return {
+    summary: parsed.summary?.trim() || fallbackSummary,
+    importance: coerceEnum(parsed.importancia ?? parsed.importance, IMPORTANCE_VALUES, 'NEUTRO'),
+    sentiment: coerceEnum(parsed.sentimiento ?? parsed.sentiment, SENTIMENT_VALUES, 'NEUTRO'),
+  };
+}
 
-  if (SENTIMENT_VALUES.includes(result as Sentiment)) {
-    return result as Sentiment;
+// How many news items to classify per LLM call. Keeps calls per request low
+// (40 items = 5 calls) without the response growing past max_tokens.
+const BATCH_SIZE = 8;
+
+/**
+ * Classify a batch of news items (summary + importance + sentiment) using ONE
+ * LLM call per BATCH_SIZE items. Returns one enrichment per input, in order;
+ * items in a failed chunk fall back to neutral (and are NOT cached upstream,
+ * so they get retried on a later request).
+ */
+export async function enrichNewsBatch(items: EnrichmentInput[]): Promise<NewsEnrichment[]> {
+  const results: NewsEnrichment[] = [];
+
+  for (let offset = 0; offset < items.length; offset += BATCH_SIZE) {
+    const chunk = items.slice(offset, offset + BATCH_SIZE);
+    results.push(...(await enrichChunk(chunk)));
   }
 
-  return 'NEUTRO';
+  return results;
+}
+
+async function enrichChunk(chunk: EnrichmentInput[]): Promise<NewsEnrichment[]> {
+  const numbered = chunk
+    .map((item, i) => `${i + 1}. ${item.text.replace(/\s+/g, ' ').slice(0, 600)}`)
+    .join('\n');
+
+  try {
+    const raw = await runPrompt(
+      'Analiza estas noticias financieras.\n' +
+        CLASSIFICATION_RUBRIC +
+        'Devuelve SOLO un array JSON con un objeto por noticia, en el MISMO orden, ' +
+        'con esta forma exacta:\n' +
+        '[{"id": 1, "summary": "...", "importancia": "...", "sentimiento": "..."}, ...]\n\n' +
+        'Noticias:\n' +
+        numbered,
+      160 * chunk.length
+    );
+
+    const match = raw.match(/\[[\s\S]*\]/);
+    if (match) {
+      const parsed = JSON.parse(match[0]) as Array<{
+        id?: number;
+        summary?: string;
+        importancia?: string;
+        sentimiento?: string;
+        importance?: string;
+        sentiment?: string;
+      }>;
+
+      if (Array.isArray(parsed)) {
+        return chunk.map((item, i) => {
+          // Prefer matching by the echoed id; fall back to position.
+          const entry = parsed.find((p) => p.id === i + 1) ?? parsed[i];
+          return entry
+            ? parseEnrichment(entry, item.fallbackSummary ?? '')
+            : neutralEnrichment(item.fallbackSummary);
+        });
+      }
+    }
+  } catch (error) {
+    console.warn('[aiService] enrichChunk failed, using neutral fallback:', error);
+  }
+
+  return chunk.map((item) => neutralEnrichment(item.fallbackSummary));
+}
+
+/**
+ * Summarize, classify market IMPORTANCE, and classify SENTIMENT for a single
+ * news item (one LLM call). Used by the tracker for newly stored items; the
+ * on-demand API path uses enrichNewsBatch instead.
+ */
+export async function enrichNews(text: string, fallbackSummary = ''): Promise<NewsEnrichment> {
+  const [result] = await enrichNewsBatch([{ text, fallbackSummary }]);
+  return result ?? neutralEnrichment(fallbackSummary);
 }

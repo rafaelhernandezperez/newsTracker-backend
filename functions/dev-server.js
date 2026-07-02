@@ -32,10 +32,11 @@ if (!process.env.GOOGLE_APPLICATION_CREDENTIALS && fs.existsSync(keyPath)) {
 }
 const hasCreds = Boolean(process.env.GOOGLE_APPLICATION_CREDENTIALS);
 
-// Load HF_TOKEN from the repo-root .env (used by AI enrichment in the tracker).
-const rootEnv = path.join(__dirname, '..', '.env');
-if (fs.existsSync(rootEnv)) {
-  for (const line of fs.readFileSync(rootEnv, 'utf8').split('\n')) {
+// Load env vars (HF_TOKEN, FINNHUB_TOKEN, ...) the same way deployed functions
+// do (functions/.env), falling back to the repo-root .env.
+for (const envPath of [path.join(__dirname, '.env'), path.join(__dirname, '..', '.env')]) {
+  if (!fs.existsSync(envPath)) continue;
+  for (const line of fs.readFileSync(envPath, 'utf8').split('\n')) {
     const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/i);
     if (m && !process.env[m[1]]) process.env[m[1]] = m[2].replace(/^["']|["']$/g, '');
   }

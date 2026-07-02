@@ -35,6 +35,28 @@ function googleNewsUrl(query: string, hl: string, gl: string, ceid: string): str
   return `https://news.google.com/rss/search?q=${q}&hl=${hl}&gl=${gl}&ceid=${ceid}`;
 }
 
+export type GoogleEdition = { name: string; language: string; hl: string; gl: string; ceid: string };
+
+export const GOOGLE_EDITIONS: GoogleEdition[] = [
+  { name: 'Google News (EN)', language: 'en', hl: 'en-US', gl: 'US', ceid: 'US:en' },
+  { name: 'Google News (ES)', language: 'es', hl: 'es-419', gl: 'ES', ceid: 'ES:es' },
+];
+
+/**
+ * Google News search RSS constrained to a date window via the `after:`/`before:`
+ * query operators. This is what lets the chart show news at their REAL historical
+ * publish dates (keyless; returns up to ~100 dated items per window).
+ */
+export function googleNewsHistoricalUrl(
+  profile: CompanyProfile,
+  edition: GoogleEdition,
+  fromYmd: string,
+  toYmd: string
+): string {
+  const query = `${buildSearchQuery(profile)} after:${fromYmd} before:${toYmd}`;
+  return googleNewsUrl(query, edition.hl, edition.gl, edition.ceid);
+}
+
 /**
  * Build a focused search query from a company profile.
  * Prefers the resolved company name, falls back to the ticker, and always

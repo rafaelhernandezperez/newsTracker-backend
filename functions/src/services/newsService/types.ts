@@ -24,6 +24,8 @@ export type NewsItem = {
   score: number;
   /** True if the story contains genuine financial/market terms (not brand-only mentions). */
   isFinancial?: boolean;
+  /** One-sentence AI summary (Spanish); shown in cards and used as the digest body. */
+  aiSummary?: string;
   /** AI-classified market impact. Drives the chart marker SIZE on the frontend. */
   importance?: 'MUY_IMPORTANTE' | 'IMPORTANTE' | 'NEUTRO' | 'POCO_RELEVANTE';
   /** AI-classified tone. Drives the chart marker COLOR on the frontend. */

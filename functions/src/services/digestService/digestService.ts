@@ -111,7 +111,8 @@ export async function runDailyDigestCycle(): Promise<DigestSummary> {
       const { sent } = await notifySubscribers([user.uid], {
         ticker: top.matchedTickers[0] ?? "",
         title: top.title,
-        body: top.summary || top.title,
+        // Prefer the one-sentence AI summary; raw RSS snippets can be long/noisy.
+        body: top.aiSummary || top.summary || top.title,
         link: top.link,
         newsId,
         sentiment: top.sentiment,

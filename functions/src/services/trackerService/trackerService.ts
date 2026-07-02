@@ -1,6 +1,6 @@
 import { fetchNewsForTicker } from "../newsService/newsService";
 import { stableNewsKey } from "../newsService/normalizers";
-import { enrichNews } from "../aiService/aiService";
+import { enrichNewsBatch } from "../aiService/aiService";
 import {
   filterNewNewsIds,
   getAllWatchedTickers,
@@ -89,8 +89,16 @@ async function processTicker(entry: WatchedTicker, notify: boolean) {
     .filter(([key]) => newKeys.has(key))
     .slice(0, MAX_NEW_PER_TICKER);
 
-  for (const [id, item] of fresh) {
-    const enrichment = await enrichNews(`${item.title}. ${item.summary ?? ""}`, item.summary ?? "");
+  // One batched LLM call for the whole run's fresh items instead of one per item.
+  const enrichments = await enrichNewsBatch(
+    fresh.map(([, item]) => ({
+      text: `${item.title}. ${item.summary ?? ""}`,
+      fallbackSummary: item.summary ?? "",
+    }))
+  );
+
+  for (const [index, [id, item]] of fresh.entries()) {
+    const enrichment = enrichments[index];
 
     const stored: StoredNews = {
       id,
