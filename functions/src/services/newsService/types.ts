@@ -1,10 +1,3 @@
-export type FeedSource = {
-  name: string;
-  url: string;
-  language?: string;
-  category?: string;
-};
-
 export type CompanyProfile = {
   ticker: string ;
   companyName?: string;

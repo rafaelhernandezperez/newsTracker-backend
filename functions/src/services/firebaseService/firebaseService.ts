@@ -7,16 +7,6 @@ if (!admin.apps.length) {
 export const db = admin.firestore();
 export const auth = admin.auth();
 
-export async function createUserProfile(uid: string, email: string): Promise<void> {
-  await db.collection("users").doc(uid).set(
-    {
-      email,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    },
-    { merge: true }
-  );
-}
-
 export async function addTickerToWatchlist(
   uid: string,
   ticker: string,

@@ -72,13 +72,3 @@ export async function resolveCompanyProfile(
     };
   });
 }
-
-/** Synchronous fallback that does not hit the network (used where name is known). */
-export function buildCompanyProfile(ticker: string, companyName?: string): CompanyProfile {
-  const cleanTicker = ticker.trim().toUpperCase();
-  return {
-    ticker: cleanTicker,
-    companyName: companyName ?? '',
-    aliases: buildAliases(cleanTicker, companyName),
-  };
-}

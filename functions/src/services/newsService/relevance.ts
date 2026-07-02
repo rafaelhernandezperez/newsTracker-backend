@@ -4,23 +4,6 @@ function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-export function countMatches(text: string, aliases: string[]): string[] {
-  const normalized = normalizeText(text);
-  const matches: string[] = [];
-
-  for (const alias of aliases) {
-    const cleanAlias = normalizeText(alias);
-    if (!cleanAlias) continue;
-
-    const regex = new RegExp(`\\b${escapeRegExp(cleanAlias)}\\b`, 'i');
-    if (regex.test(normalized)) {
-      matches.push(alias);
-    }
-  }
-
-  return matches;
-}
-
 /**
  * Terms that mark a story as genuinely financial / market-relevant (EN + ES).
  * Deliberately excludes generic words inherent to a company's description

@@ -1,4 +1,4 @@
-import type { CompanyProfile, FeedSource } from './types';
+import type { CompanyProfile } from './types';
 
 /**
  * Per-ticker query sources.
@@ -95,36 +95,5 @@ export const QUERY_SOURCES: QuerySource[] = [
       `https://feeds.finance.yahoo.com/rss/2.0/headline?s=${encodeURIComponent(
         profile.ticker
       )}&region=US&lang=en-US`,
-  },
-];
-
-/**
- * Broad market feeds, kept for a general (non-ticker) market overview endpoint.
- * NOT used for per-ticker retrieval anymore.
- */
-export const MARKET_FEED_SOURCES: FeedSource[] = [
-  {
-    name: 'Yahoo Finance',
-    url: 'https://finance.yahoo.com/news/rssindex',
-    language: 'en',
-    category: 'financial',
-  },
-  {
-    name: 'CNBC Top News',
-    url: 'https://www.cnbc.com/id/100003114/device/rss/rss.html',
-    language: 'en',
-    category: 'financial',
-  },
-  {
-    name: 'MarketWatch MarketPulse',
-    url: 'https://feeds.content.dowjones.io/public/rss/mw_marketpulse',
-    language: 'en',
-    category: 'markets',
-  },
-  {
-    name: 'Expansion Mercados',
-    url: 'https://e00-expansion.uecdn.es/rss/mercados.xml',
-    language: 'es',
-    category: 'markets',
   },
 ];
