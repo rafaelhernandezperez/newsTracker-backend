@@ -7,6 +7,7 @@ import marketRouter from "./routes/market.js";
 import tickersRouter from "./routes/tickers.js";
 import watchlistRouter from "./routes/watchlist.js";
 import devicesRouter from "./routes/devices.js";
+import preferencesRouter from "./routes/preferences.js";
 import { requireAuth } from "./middleware/auth.js";
 
 const app = express();
@@ -21,6 +22,7 @@ app.use("/market", requireAuth, marketRouter);
 app.use("/tickers", requireAuth, tickersRouter);
 app.use("/watchlist", watchlistRouter);
 app.use("/devices", devicesRouter);
+app.use("/preferences", preferencesRouter);
 
 app.use((req: express.Request, res: express.Response) => {
   return res.status(404).json({ ok: false, message: "Not found" });

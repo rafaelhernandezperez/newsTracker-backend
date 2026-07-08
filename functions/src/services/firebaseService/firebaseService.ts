@@ -105,6 +105,83 @@ export async function pruneInvalidTokens(tokens: string[]): Promise<void> {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Alert preferences                                                          */
+/* -------------------------------------------------------------------------- */
+
+/** Which alert channels a user opted into (onboarding step 3). */
+export type AlertPrefs = {
+  /** Push when a watched ticker moves more than ±3% in a day. */
+  priceMoves: boolean;
+  /** Push high-impact (MUY_IMPORTANTE) news as soon as the tracker stores it. */
+  highImpact: boolean;
+  /** Include the user in the daily 9am digest. */
+  dailyDigest: boolean;
+};
+
+// Users who never saved preferences keep today's behavior: everything on.
+export const DEFAULT_ALERT_PREFS: AlertPrefs = {
+  priceMoves: true,
+  highImpact: true,
+  dailyDigest: true,
+};
+
+function coerceAlertPrefs(raw: unknown): AlertPrefs {
+  const data = (raw ?? {}) as Partial<Record<keyof AlertPrefs, unknown>>;
+  return {
+    priceMoves: typeof data.priceMoves === "boolean" ? data.priceMoves : DEFAULT_ALERT_PREFS.priceMoves,
+    highImpact: typeof data.highImpact === "boolean" ? data.highImpact : DEFAULT_ALERT_PREFS.highImpact,
+    dailyDigest: typeof data.dailyDigest === "boolean" ? data.dailyDigest : DEFAULT_ALERT_PREFS.dailyDigest,
+  };
+}
+
+export async function getAlertPrefs(uid: string): Promise<AlertPrefs> {
+  const snap = await db.collection("users").doc(uid).get();
+  return coerceAlertPrefs(snap.get("alertPrefs"));
+}
+
+export async function setAlertPrefs(uid: string, prefs: AlertPrefs): Promise<void> {
+  await db.collection("users").doc(uid).set(
+    {
+      alertPrefs: coerceAlertPrefs(prefs),
+      alertPrefsUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+}
+
+/** Batch-read alert prefs so scheduler fan-out costs one getAll, not N gets. */
+export async function getAlertPrefsForUsers(uids: string[]): Promise<Map<string, AlertPrefs>> {
+  const unique = Array.from(new Set(uids));
+  const prefs = new Map<string, AlertPrefs>();
+  if (unique.length === 0) return prefs;
+
+  const refs = unique.map((uid) => db.collection("users").doc(uid));
+  const snaps = await db.getAll(...refs);
+  snaps.forEach((snap, index) => {
+    prefs.set(unique[index], coerceAlertPrefs(snap.get("alertPrefs")));
+  });
+  return prefs;
+}
+
+/**
+ * Atomically claim "the >3% price alert for this ticker was sent on this date".
+ * `create()` fails if the doc exists, so concurrent cycles can't double-send.
+ * Returns false when the alert already went out today.
+ */
+export async function claimPriceAlert(ticker: string, dateKey: string): Promise<boolean> {
+  try {
+    await db.collection("priceAlerts").doc(`${ticker.toUpperCase()}_${dateKey}`).create({
+      ticker: ticker.toUpperCase(),
+      date: dateKey,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
 /* Watchlist fan-out (cross-user)                                             */
 /* -------------------------------------------------------------------------- */
 

@@ -4,6 +4,7 @@ import {
   getUsersWithWatchlists,
   getRecentDigestNewsIds,
   recordDigestNewsId,
+  getAlertPrefsForUsers,
 } from "../firebaseService/firebaseService";
 import { notifySubscribers } from "../notificationService/notificationService";
 import type { NewsItem } from "../newsService/types";
@@ -87,8 +88,17 @@ async function fetchNewsByTicker(
  * with no fresh news or whose top story was sent in a recent digest.
  */
 export async function runDailyDigestCycle(): Promise<DigestSummary> {
-  const users = await getUsersWithWatchlists();
-  const summary: DigestSummary = { users: users.length, notified: 0, skipped: 0 };
+  const allUsers = await getUsersWithWatchlists();
+  const summary: DigestSummary = { users: allUsers.length, notified: 0, skipped: 0 };
+
+  // Honor the onboarding "Daily digest" toggle: users who turned it off are
+  // skipped before any news is fetched on their behalf.
+  const prefsByUid = await getAlertPrefsForUsers(allUsers.map((user) => user.uid));
+  const users = allUsers.filter((user) => {
+    const wantsDigest = prefsByUid.get(user.uid)?.dailyDigest !== false;
+    if (!wantsDigest) summary.skipped += 1;
+    return wantsDigest;
+  });
 
   // Collect unique tickers across all users, keeping the first companyName seen.
   const uniqueTickers = new Map<string, string | undefined>();
