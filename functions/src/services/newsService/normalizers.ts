@@ -10,21 +10,18 @@ export function normalizeText(value?: string): string {
     .trim();
 }
 
-export function createNewsId(source: string, link: string, title: string): string {
-  return crypto
-    .createHash('sha256')
-    .update(`${source}|${link}|${title}`)
-    .digest('hex')
-    .slice(0, 24);
-}
-
 /**
- * Stable, source-independent id for an article, so the SAME story collapses
- * to one document across feeds and across scheduler runs (used as the Firestore
- * doc id for persistence/dedup). Based on the canonical link, falling back to title.
+ * Stable, source-independent id for an article, so the SAME story collapses to
+ * one document across feeds and across scheduler runs (used as the enrichment
+ * cache key AND the Firestore doc id — one scheme, so a story is never enriched
+ * twice or stored twice under different ids).
+ *
+ * Keyed on the normalized TITLE first: the same story carries different URLs on
+ * Google News (redirect links), Yahoo and Finnhub, so links can't identify it
+ * across sources. Falls back to the link when there is no title.
  */
 export function stableNewsKey(link?: string, title?: string): string {
-  const canonical = normalizeText(link?.trim() || title || '');
+  const canonical = normalizeText(title?.trim() || link || '');
   return crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 32);
 }
 
@@ -37,8 +34,7 @@ export function dedupeNews(items: NewsItem[]): NewsItem[] {
   };
 
   for (const item of items) {
-    const keySource = item.link?.trim() || item.title || '';
-    const key = normalizeText(keySource);
+    const key = normalizeText(item.title?.trim() || item.link || '');
 
     if (!key) {
       continue;
@@ -53,7 +49,11 @@ export function dedupeNews(items: NewsItem[]): NewsItem[] {
     const existingDate = toTimestamp(existing.isoDate ?? existing.pubDate);
     const currentDate = toTimestamp(item.isoDate ?? item.pubDate);
 
-    if (item.score > existing.score || currentDate > existingDate) {
+    // Keep the better-scored duplicate; recency only breaks ties.
+    if (
+      item.score > existing.score ||
+      (item.score === existing.score && currentDate > existingDate)
+    ) {
       map.set(key, item);
     }
   }

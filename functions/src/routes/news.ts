@@ -45,7 +45,7 @@ router.get('/:ticker', async (req: Request, res: Response) => {
     const parsedLimit = rawLimit ? Number(rawLimit) : undefined;
     const limit =
       typeof parsedLimit === 'number' && Number.isFinite(parsedLimit) && parsedLimit > 0
-        ? Math.floor(parsedLimit)
+        ? Math.min(Math.floor(parsedLimit), 100)
         : 20;
 
     const range =

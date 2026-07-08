@@ -7,7 +7,11 @@ router.get('/:ticker', async (req: Request, res: Response) => {
   try {
     const { ticker } = req.params;
     const requestedDays = Number(req.query.days);
-    const days = Number.isFinite(requestedDays) && requestedDays > 0 ? requestedDays : 30;
+    // Cap at ~10 years so absurd values can't produce runaway date math.
+    const days =
+      Number.isFinite(requestedDays) && requestedDays > 0
+        ? Math.min(Math.floor(requestedDays), 3650)
+        : 30;
 
     const [quote, history] = await Promise.all([
       getQuote(ticker),

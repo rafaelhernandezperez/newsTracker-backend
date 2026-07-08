@@ -2,9 +2,8 @@ import { fetchNewsForTicker } from "../newsService/newsService";
 import { stableNewsKey } from "../newsService/normalizers";
 import {
   getUsersWithWatchlists,
-  getLastDigestNewsId,
-  setLastDigestNewsId,
-  type UserWatchlist,
+  getRecentDigestNewsIds,
+  recordDigestNewsId,
 } from "../firebaseService/firebaseService";
 import { notifySubscribers } from "../notificationService/notificationService";
 import type { NewsItem } from "../newsService/types";
@@ -13,6 +12,8 @@ import type { NewsItem } from "../newsService/types";
 const DIGEST_LOOKBACK_DAYS = 1;
 // How many items to pull per ticker before ranking; small, since we only keep one.
 const PER_TICKER_LIMIT = 5;
+// How many tickers to fetch/enrich concurrently.
+const FETCH_CONCURRENCY = 5;
 
 export type DigestSummary = {
   users: number;
@@ -48,44 +49,58 @@ function isMoreRelevant(candidate: NewsItem, current: NewsItem): boolean {
   return publishedAtMs(candidate) > publishedAtMs(current);
 }
 
-/** Find the single most relevant recent article across all of a user's tickers. */
-async function pickTopNewsForUser(user: UserWatchlist): Promise<NewsItem | null> {
-  const perTicker = await Promise.all(
-    user.tickers.map(async ({ ticker, companyName }) => {
-      try {
-        return await fetchNewsForTicker(ticker, {
-          companyName,
-          daysBack: DIGEST_LOOKBACK_DAYS,
-          limit: PER_TICKER_LIMIT,
-          enrich: true,
-        });
-      } catch (error) {
-        console.error(`[digest] fetch failed for ${ticker}:`, error);
-        return [] as NewsItem[];
-      }
-    })
-  );
+/**
+ * Fetch + enrich each unique ticker ONCE, no matter how many users follow it.
+ * Cost then scales with distinct tickers, not users × tickers.
+ */
+async function fetchNewsByTicker(
+  tickers: Map<string, string | undefined>
+): Promise<Map<string, NewsItem[]>> {
+  const entries = Array.from(tickers.entries());
+  const result = new Map<string, NewsItem[]>();
 
-  // Rank EVERY fetched article (across all tickers) against each other and keep
-  // the single most relevant one.
-  let top: NewsItem | null = null;
-  for (const item of perTicker.flat()) {
-    if (!top || isMoreRelevant(item, top)) {
-      top = item;
-    }
+  for (let i = 0; i < entries.length; i += FETCH_CONCURRENCY) {
+    await Promise.all(
+      entries.slice(i, i + FETCH_CONCURRENCY).map(async ([ticker, companyName]) => {
+        try {
+          const items = await fetchNewsForTicker(ticker, {
+            companyName,
+            daysBack: DIGEST_LOOKBACK_DAYS,
+            limit: PER_TICKER_LIMIT,
+            enrich: true,
+          });
+          result.set(ticker, items);
+        } catch (error) {
+          console.error(`[digest] fetch failed for ${ticker}:`, error);
+          result.set(ticker, []);
+        }
+      })
+    );
   }
 
-  return top;
+  return result;
 }
 
 /**
  * One daily digest cycle: for every user, find the single most relevant story
  * across the tickers they follow and push exactly one notification. Skips users
- * with no fresh news or whose top story was already sent in the previous digest.
+ * with no fresh news or whose top story was sent in a recent digest.
  */
 export async function runDailyDigestCycle(): Promise<DigestSummary> {
   const users = await getUsersWithWatchlists();
   const summary: DigestSummary = { users: users.length, notified: 0, skipped: 0 };
+
+  // Collect unique tickers across all users, keeping the first companyName seen.
+  const uniqueTickers = new Map<string, string | undefined>();
+  for (const user of users) {
+    for (const { ticker, companyName } of user.tickers) {
+      if (!uniqueTickers.has(ticker) || (!uniqueTickers.get(ticker) && companyName)) {
+        uniqueTickers.set(ticker, companyName);
+      }
+    }
+  }
+
+  const newsByTicker = await fetchNewsByTicker(uniqueTickers);
 
   for (const user of users) {
     try {
@@ -94,16 +109,25 @@ export async function runDailyDigestCycle(): Promise<DigestSummary> {
         continue;
       }
 
-      const top = await pickTopNewsForUser(user);
-      if (!top) {
-        summary.skipped += 1;
-        continue;
+      const recentIds = await getRecentDigestNewsIds(user.uid);
+
+      // Rank EVERY fetched article across the user's tickers, skipping stories
+      // already sent to this user in a recent digest (not just the last one —
+      // yesterday's runner-up shouldn't become today's "news").
+      let top: NewsItem | null = null;
+      let topId: string | null = null;
+      for (const { ticker } of user.tickers) {
+        for (const item of newsByTicker.get(ticker) ?? []) {
+          const newsId = stableNewsKey(item.link, item.title);
+          if (recentIds.includes(newsId)) continue;
+          if (!top || isMoreRelevant(item, top)) {
+            top = item;
+            topId = newsId;
+          }
+        }
       }
 
-      const newsId = stableNewsKey(top.link, top.title);
-      const lastSent = await getLastDigestNewsId(user.uid);
-      if (newsId === lastSent) {
-        // Nothing more relevant than yesterday's headline — don't repeat it.
+      if (!top || !topId) {
         summary.skipped += 1;
         continue;
       }
@@ -114,12 +138,12 @@ export async function runDailyDigestCycle(): Promise<DigestSummary> {
         // Prefer the one-sentence AI summary; raw RSS snippets can be long/noisy.
         body: top.aiSummary || top.summary || top.title,
         link: top.link,
-        newsId,
+        newsId: topId,
         sentiment: top.sentiment,
       });
 
       if (sent > 0) {
-        await setLastDigestNewsId(user.uid, newsId);
+        await recordDigestNewsId(user.uid, topId);
         summary.notified += 1;
       } else {
         summary.skipped += 1;

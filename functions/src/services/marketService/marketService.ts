@@ -51,9 +51,15 @@ export async function getHistory(ticker: string, days: number = 30) {
   const endDate = new Date();
   const startDate = new Date();
   startDate.setDate(startDate.getDate() - days);
-  const history = await yf.historical(ticker, { period1: startDate, period2: endDate });
+  // chart() replaces historical(), which is deprecated in yahoo-finance2 v3
+  // (Yahoo shut down the underlying endpoint).
+  const result = await yf.chart(ticker, {
+    period1: startDate,
+    period2: endDate,
+    interval: '1d',
+  });
 
-  return history
+  return (result.quotes ?? [])
     .filter((entry) => entry.date instanceof Date)
     .map((entry): MarketHistoryPoint => ({
       date: entry.date.toISOString().slice(0, 10),

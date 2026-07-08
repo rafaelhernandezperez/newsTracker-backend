@@ -8,7 +8,7 @@ import {
 } from './sources';
 import { resolveCompanyProfile } from './companyResolver';
 import { calculateRelevanceScore, financialSignal } from './relevance';
-import { createNewsId, dedupeNews } from './normalizers';
+import { stableNewsKey, dedupeNews } from './normalizers';
 import { TtlCache } from './cache';
 import { enrichNewsBatch } from '../aiService/aiService';
 import type { CompanyProfile, NewsItem } from './types';
@@ -80,6 +80,9 @@ export async function enrichNewsItems(items: NewsItem[]): Promise<NewsItem[]> {
         }))
       );
       enrichments.forEach((enrichment, i) => {
+        // null = enrichment failed for this item; leave it uncached so a later
+        // request retries instead of freezing a fake NEUTRO for 6 hours.
+        if (!enrichment) return;
         enrichmentCache.set(pending[i].id, {
           importance: enrichment.importance,
           sentiment: enrichment.sentiment,
@@ -221,7 +224,7 @@ function buildScoredItem(input: ScoredItemInput): NewsItem | null {
   const signal = financialSignal(title, input.summary);
 
   return {
-    id: createNewsId(input.sourceName, link, title),
+    id: stableNewsKey(link, title),
     title,
     link,
     source: input.sourceName,

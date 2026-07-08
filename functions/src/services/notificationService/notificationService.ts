@@ -28,8 +28,7 @@ export async function notifySubscribers(
     return { sent: 0, failed: 0 };
   }
 
-  const message: admin.messaging.MulticastMessage = {
-    tokens,
+  const payload = {
     notification: {
       title: `${notification.ticker}: ${notification.title}`.slice(0, 240),
       body: notification.body.slice(0, 480),
@@ -40,23 +39,33 @@ export async function notifySubscribers(
       link: notification.link,
       sentiment: notification.sentiment ?? "NEUTRO",
     },
-    android: { priority: "high" },
+    android: { priority: "high" as const },
     apns: { payload: { aps: { sound: "default" } } },
   };
 
-  const response = await admin.messaging().sendEachForMulticast(message);
-
+  // sendEachForMulticast accepts at most 500 tokens per call.
+  let sent = 0;
+  let failed = 0;
   const invalidTokens: string[] = [];
-  response.responses.forEach((resp, i) => {
-    if (!resp.success && resp.error && INVALID_TOKEN_CODES.has(resp.error.code)) {
-      invalidTokens.push(tokens[i]);
-    }
-  });
+  for (let offset = 0; offset < tokens.length; offset += 500) {
+    const chunk = tokens.slice(offset, offset + 500);
+    const message: admin.messaging.MulticastMessage = { tokens: chunk, ...payload };
+    const response = await admin.messaging().sendEachForMulticast(message);
+
+    sent += response.successCount;
+    failed += response.failureCount;
+    response.responses.forEach((resp, i) => {
+      if (!resp.success && resp.error && INVALID_TOKEN_CODES.has(resp.error.code)) {
+        invalidTokens.push(chunk[i]);
+      }
+    });
+  }
+
   if (invalidTokens.length > 0) {
     await pruneInvalidTokens(invalidTokens).catch((err) =>
       console.warn("[notificationService] token prune failed:", err)
     );
   }
 
-  return { sent: response.successCount, failed: response.failureCount };
+  return { sent, failed };
 }

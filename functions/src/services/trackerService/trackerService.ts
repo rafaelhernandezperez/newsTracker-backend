@@ -100,6 +100,14 @@ async function processTicker(entry: WatchedTicker, notify: boolean) {
   for (const [index, [id, item]] of fresh.entries()) {
     const enrichment = enrichments[index];
 
+    // Enrichment failed (LLM unreachable, bad response…): skip persisting so
+    // the item is still "new" next cycle and gets retried — storing it now
+    // would freeze a fake NEUTRO classification forever.
+    if (!enrichment) {
+      console.warn(`[tracker] skipping ${entry.ticker} item (enrichment failed): ${item.title}`);
+      continue;
+    }
+
     const stored: StoredNews = {
       id,
       ticker: entry.ticker,

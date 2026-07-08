@@ -12,6 +12,7 @@ type Entry<T> = {
 
 export class TtlCache<T> {
   private readonly store = new Map<string, Entry<T>>();
+  private readonly pending = new Map<string, Promise<T>>();
 
   constructor(private readonly ttlMs: number, private readonly maxEntries = 500) {}
 
@@ -38,14 +39,31 @@ export class TtlCache<T> {
     this.store.set(key, { value, expiresAt: Date.now() + this.ttlMs });
   }
 
-  /** Get the cached value or compute, store, and return it. */
+  /**
+   * Get the cached value or compute, store, and return it. Concurrent calls
+   * for the same key share one in-flight compute instead of each running the
+   * full fetch (thundering-herd protection on cold caches).
+   */
   async getOrSet(key: string, compute: () => Promise<T>): Promise<T> {
     const cached = this.get(key);
     if (cached !== undefined) {
       return cached;
     }
-    const value = await compute();
-    this.set(key, value);
-    return value;
+
+    const inFlight = this.pending.get(key);
+    if (inFlight) {
+      return inFlight;
+    }
+
+    const promise = compute()
+      .then((value) => {
+        this.set(key, value);
+        return value;
+      })
+      .finally(() => {
+        this.pending.delete(key);
+      });
+    this.pending.set(key, promise);
+    return promise;
   }
 }

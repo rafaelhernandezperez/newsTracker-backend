@@ -39,10 +39,25 @@ function getHuggingFaceToken(): string {
   return token;
 }
 
+const RETRYABLE_NETWORK_CODES = new Set([
+  'ECONNABORTED',
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'ERR_NETWORK',
+]);
+
 function isRetryable(error: unknown): boolean {
-  const status = (error as AxiosError)?.response?.status;
-  // Retry on rate limits, provider hiccups, and network-level failures.
-  return status === undefined || status === 429 || status >= 500;
+  const axiosError = error as AxiosError;
+  const status = axiosError?.response?.status;
+  if (status !== undefined) {
+    // Retry on rate limits and provider hiccups only.
+    return status === 429 || status >= 500;
+  }
+  // No HTTP status: retry known transient network failures, but not local
+  // errors (missing token, JSON bugs) — those fail identically every attempt.
+  return RETRYABLE_NETWORK_CODES.has(axiosError?.code ?? '');
 }
 
 async function callModel(model: string, prompt: string, maxTokens: number): Promise<string> {
@@ -174,12 +189,15 @@ const BATCH_SIZE = 8;
 
 /**
  * Classify a batch of news items (summary + importance + sentiment) using ONE
- * LLM call per BATCH_SIZE items. Returns one enrichment per input, in order;
- * items in a failed chunk fall back to neutral (and are NOT cached upstream,
- * so they get retried on a later request).
+ * LLM call per BATCH_SIZE items. Returns one entry per input, in order; items
+ * in a failed chunk come back as null so callers can distinguish "the model
+ * said NEUTRO" from "enrichment failed" — failed items must not be cached or
+ * persisted as if classified, or they would never be retried.
  */
-export async function enrichNewsBatch(items: EnrichmentInput[]): Promise<NewsEnrichment[]> {
-  const results: NewsEnrichment[] = [];
+export async function enrichNewsBatch(
+  items: EnrichmentInput[]
+): Promise<Array<NewsEnrichment | null>> {
+  const results: Array<NewsEnrichment | null> = [];
 
   for (let offset = 0; offset < items.length; offset += BATCH_SIZE) {
     const chunk = items.slice(offset, offset + BATCH_SIZE);
@@ -189,7 +207,7 @@ export async function enrichNewsBatch(items: EnrichmentInput[]): Promise<NewsEnr
   return results;
 }
 
-async function enrichChunk(chunk: EnrichmentInput[]): Promise<NewsEnrichment[]> {
+async function enrichChunk(chunk: EnrichmentInput[]): Promise<Array<NewsEnrichment | null>> {
   const numbered = chunk
     .map((item, i) => `${i + 1}. ${item.text.replace(/\s+/g, ' ').slice(0, 600)}`)
     .join('\n');
@@ -219,7 +237,9 @@ async function enrichChunk(chunk: EnrichmentInput[]): Promise<NewsEnrichment[]> 
 
       if (Array.isArray(parsed)) {
         return chunk.map((item, i) => {
-          // Prefer matching by the echoed id; fall back to position.
+          // Prefer matching by the echoed id; fall back to position. A missing
+          // entry means the model answered but skipped this item — treat its
+          // classification as genuinely neutral rather than failed.
           const entry = parsed.find((p) => p.id === i + 1) ?? parsed[i];
           return entry
             ? parseEnrichment(entry, item.fallbackSummary ?? '')
@@ -227,19 +247,23 @@ async function enrichChunk(chunk: EnrichmentInput[]): Promise<NewsEnrichment[]> 
         });
       }
     }
+    console.warn('[aiService] enrichChunk: response contained no JSON array');
   } catch (error) {
-    console.warn('[aiService] enrichChunk failed, using neutral fallback:', error);
+    console.warn('[aiService] enrichChunk failed:', error);
   }
 
-  return chunk.map((item) => neutralEnrichment(item.fallbackSummary));
+  // Signal failure so callers skip caching/persisting and retry later.
+  return chunk.map(() => null);
 }
 
 /**
  * Summarize, classify market IMPORTANCE, and classify SENTIMENT for a single
- * news item (one LLM call). Used by the tracker for newly stored items; the
- * on-demand API path uses enrichNewsBatch instead.
+ * news item (one LLM call). Returns null when enrichment failed.
  */
-export async function enrichNews(text: string, fallbackSummary = ''): Promise<NewsEnrichment> {
+export async function enrichNews(
+  text: string,
+  fallbackSummary = ''
+): Promise<NewsEnrichment | null> {
   const [result] = await enrichNewsBatch([{ text, fallbackSummary }]);
-  return result ?? neutralEnrichment(fallbackSummary);
+  return result ?? null;
 }

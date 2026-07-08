@@ -95,9 +95,13 @@ export async function pruneInvalidTokens(tokens: string[]): Promise<void> {
       db.collectionGroup("devices").where("token", "==", token).get()
     )
   );
-  const batch = db.batch();
-  snaps.flatMap((snap) => snap.docs).forEach((doc) => batch.delete(doc.ref));
-  await batch.commit();
+  // Firestore batches are limited to 500 operations.
+  const docs = snaps.flatMap((snap) => snap.docs);
+  for (let i = 0; i < docs.length; i += 500) {
+    const batch = db.batch();
+    docs.slice(i, i + 500).forEach((doc) => batch.delete(doc.ref));
+    await batch.commit();
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -172,17 +176,31 @@ export async function getUsersWithWatchlists(): Promise<UserWatchlist[]> {
   return Array.from(byUser.values());
 }
 
-/** The news id last sent to a user in a digest, so we never repeat it. */
-export async function getLastDigestNewsId(uid: string): Promise<string | undefined> {
+/**
+ * A small ring of the most recent news ids sent to a user in digests, so
+ * yesterday's runner-up can't be pushed today as if it were fresh (a single
+ * "last id" only guarded against exact repeats of the top story).
+ */
+const DIGEST_HISTORY_SIZE = 10;
+
+export async function getRecentDigestNewsIds(uid: string): Promise<string[]> {
   const snap = await db.collection("users").doc(uid).get();
-  const value = snap.get("lastDigestNewsId");
-  return typeof value === "string" ? value : undefined;
+  const ring = snap.get("recentDigestNewsIds");
+  if (Array.isArray(ring)) {
+    return ring.filter((value): value is string => typeof value === "string");
+  }
+  // Legacy field from before the ring existed.
+  const legacy = snap.get("lastDigestNewsId");
+  return typeof legacy === "string" ? [legacy] : [];
 }
 
-export async function setLastDigestNewsId(uid: string, newsId: string): Promise<void> {
+export async function recordDigestNewsId(uid: string, newsId: string): Promise<void> {
+  const recent = await getRecentDigestNewsIds(uid);
+  const ring = [newsId, ...recent.filter((id) => id !== newsId)].slice(0, DIGEST_HISTORY_SIZE);
   await db.collection("users").doc(uid).set(
     {
       lastDigestNewsId: newsId,
+      recentDigestNewsIds: ring,
       lastDigestAt: admin.firestore.FieldValue.serverTimestamp(),
     },
     { merge: true }
@@ -237,14 +255,21 @@ export async function getStoredNews(
 
 export async function saveNewsItem(item: StoredNews): Promise<void> {
   const { id, ...rest } = item;
-  await db
-    .collection("news")
-    .doc(id)
-    .set(
-      {
+  try {
+    // create() (not set/merge): the doc id is the dedup key, so a concurrent
+    // scheduler run that stored it first must not clobber createdAt (which
+    // orders the /stored feed) or re-write the enrichment.
+    await db
+      .collection("news")
+      .doc(id)
+      .create({
         ...rest,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
+      });
+  } catch (error) {
+    if ((error as { code?: number }).code === 6 /* ALREADY_EXISTS */) {
+      return;
+    }
+    throw error;
+  }
 }
