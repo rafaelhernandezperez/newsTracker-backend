@@ -42,7 +42,13 @@ for (const envPath of [path.join(__dirname, '.env'), path.join(__dirname, '..', 
   }
 }
 
-const app = require('./lib/index.js').default;
+const express = require('express');
+const api = require('./lib/index.js').default;
+
+// The API app ends with a catch-all 404 handler, so routes added to it here
+// would never be reached. Mount the /dev helpers on an OUTER app instead and
+// delegate everything else to the API.
+const app = express();
 
 // Dev-only manual tracker trigger.
 app.post('/dev/track', async (_req, res) => {
@@ -67,6 +73,9 @@ app.post('/dev/digest', async (_req, res) => {
     return res.status(500).json({ ok: false, message: String(error) });
   }
 });
+
+// Everything that isn't a /dev helper goes to the real API (incl. its 404).
+app.use(api);
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
