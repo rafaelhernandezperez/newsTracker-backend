@@ -8,7 +8,7 @@ import {
 } from './sources';
 import { resolveCompanyProfile } from './companyResolver';
 import { calculateRelevanceScore, financialSignal } from './relevance';
-import { stableNewsKey, dedupeNews } from './normalizers';
+import { stableNewsKey, dedupeNews, normalizeText } from './normalizers';
 import { TtlCache } from './cache';
 import { enrichNewsBatch } from '../aiService/aiService';
 import type { CompanyProfile, NewsItem } from './types';
@@ -184,9 +184,16 @@ function isWithinDateRange(item: NewsItem, range: ResolvedDateRange): boolean {
   return true;
 }
 
-/** Strip Google News' trailing " - Publisher" suffix from a title. */
+/**
+ * Strip Google News' trailing " - Publisher" suffix from a title. Publisher
+ * names can themselves contain hyphens (e.g. "ad-hoc-news.de"), so cut at the
+ * LAST " - " separator instead of requiring a hyphen-free tail.
+ */
 function cleanTitle(title: string): string {
-  return title.replace(/\s+-\s+[^-]+$/, '').trim() || title.trim();
+  const trimmed = title.trim();
+  const idx = trimmed.lastIndexOf(' - ');
+  if (idx <= 0) return trimmed;
+  return trimmed.slice(0, idx).trim() || trimmed;
 }
 
 type ScoredItemInput = {
@@ -212,6 +219,13 @@ function buildScoredItem(input: ScoredItemInput): NewsItem | null {
   const link = input.link.trim();
   if (!title || !link) return null;
 
+  // Google News "summaries" are usually just the headline + publisher again;
+  // keep a summary only when it adds text beyond the title, so cards and push
+  // bodies don't repeat themselves. Scoring below still sees the raw text.
+  const summary = normalizeText(input.summary).startsWith(normalizeText(title))
+    ? ''
+    : input.summary;
+
   const keywordScore = calculateRelevanceScore(
     title,
     input.summary,
@@ -228,7 +242,7 @@ function buildScoredItem(input: ScoredItemInput): NewsItem | null {
     title,
     link,
     source: input.sourceName,
-    summary: input.summary,
+    summary,
     pubDate: input.pubDate,
     isoDate: input.isoDate,
     language: input.language,
