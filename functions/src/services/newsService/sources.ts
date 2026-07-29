@@ -38,8 +38,8 @@ function googleNewsUrl(query: string, hl: string, gl: string, ceid: string): str
 export type GoogleEdition = { name: string; language: string; hl: string; gl: string; ceid: string };
 
 export const GOOGLE_EDITIONS: GoogleEdition[] = [
-  { name: 'Google News (EN)', language: 'en', hl: 'en-US', gl: 'US', ceid: 'US:en' },
-  { name: 'Google News (ES)', language: 'es', hl: 'es-419', gl: 'ES', ceid: 'ES:es' },
+  { name: 'Google News', language: 'en', hl: 'en-US', gl: 'US', ceid: 'US:en' },
+  { name: 'Google News', language: 'es', hl: 'es-419', gl: 'ES', ceid: 'ES:es' },
 ];
 
 /**

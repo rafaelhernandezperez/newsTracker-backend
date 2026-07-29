@@ -62,6 +62,15 @@ router.get('/:ticker', async (req: Request, res: Response) => {
       typeof parsedDaysBack === 'number' && Number.isFinite(parsedDaysBack) && parsedDaysBack > 0
         ? parsedDaysBack
         : undefined;
+    const rssOnly = getQueryString(req.query.rssOnly)?.toLowerCase() === 'true';
+    const requestedLanguage =
+      getQueryString(req.query.lang) ?? getQueryString(req.query.language) ?? 'en';
+    if (requestedLanguage !== 'en' && requestedLanguage !== 'es') {
+      return res.status(400).json({
+        ok: false,
+        message: 'Language must be "en" or "es"',
+      });
+    }
 
     const news = await fetchNewsForTicker(ticker, {
       companyName,
@@ -70,9 +79,11 @@ router.get('/:ticker', async (req: Request, res: Response) => {
       from,
       to,
       daysBack,
+      rssOnly,
       // Attach AI importance + sentiment so the frontend chart can size/color
       // its news markers. Cached per item, so repeat requests stay cheap.
       enrich: true,
+      language: requestedLanguage,
     });
 
     return res.json({

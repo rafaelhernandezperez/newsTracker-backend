@@ -43,6 +43,7 @@ const googleHistoryCache = new TtlCache<NewsItem[]>(12 * 60 * 60 * 1000);
 const enrichmentCache = new TtlCache<{
   importance: NonNullable<NewsItem['importance']>;
   sentiment: NonNullable<NewsItem['sentiment']>;
+  localizedTitle?: string;
   aiSummary?: string;
 }>(6 * 60 * 60 * 1000);
 
@@ -59,8 +60,12 @@ type FetchNewsOptions = {
   range?: string;
   daysBack?: number;
   requireFinancial?: boolean;
+  /** Restrict results to the configured RSS feeds (no search APIs/backfill). */
+  rssOnly?: boolean;
   /** When true, attach AI importance + sentiment to the returned items. */
   enrich?: boolean;
+  /** Language used for every AI summary returned to the interface. */
+  language?: 'en' | 'es';
 };
 
 /**
@@ -68,24 +73,32 @@ type FetchNewsOptions = {
  * uncached items are classified in batched LLM calls. On failure items are
  * returned unchanged (markers then fall back to a neutral size/color).
  */
-export async function enrichNewsItems(items: NewsItem[]): Promise<NewsItem[]> {
-  const pending = items.filter((item) => !enrichmentCache.get(item.id));
+export async function enrichNewsItems(
+  items: NewsItem[],
+  language: 'en' | 'es' = 'en'
+): Promise<NewsItem[]> {
+  const cacheKey = (item: NewsItem): string => `${item.id}|${language}`;
+  const pending = items.filter((item) => !enrichmentCache.get(cacheKey(item)));
 
   if (pending.length > 0) {
     try {
       const enrichments = await enrichNewsBatch(
         pending.map((item) => ({
           text: `${item.title}. ${item.summary ?? ''}`,
-          fallbackSummary: item.summary ?? '',
+          targetLanguage: language,
+          // Never fall back to a source-language snippet that would make the
+          // interface mix English and Spanish.
+          fallbackSummary: item.language === language ? item.summary ?? '' : '',
         }))
       );
       enrichments.forEach((enrichment, i) => {
         // null = enrichment failed for this item; leave it uncached so a later
         // request retries instead of freezing a fake NEUTRO for 6 hours.
         if (!enrichment) return;
-        enrichmentCache.set(pending[i].id, {
+        enrichmentCache.set(cacheKey(pending[i]), {
           importance: enrichment.importance,
           sentiment: enrichment.sentiment,
+          localizedTitle: enrichment.localizedTitle || undefined,
           aiSummary: enrichment.summary || undefined,
         });
       });
@@ -95,7 +108,7 @@ export async function enrichNewsItems(items: NewsItem[]): Promise<NewsItem[]> {
   }
 
   return items.map((item) => {
-    const enrichment = enrichmentCache.get(item.id);
+    const enrichment = enrichmentCache.get(cacheKey(item));
     return enrichment ? { ...item, ...enrichment } : item;
   });
 }
@@ -190,7 +203,15 @@ function isWithinDateRange(item: NewsItem, range: ResolvedDateRange): boolean {
  * LAST " - " separator instead of requiring a hyphen-free tail.
  */
 function cleanTitle(title: string): string {
-  const trimmed = title.trim();
+  // Publishers often append exchange annotations such as "(NYSE:IBM)" or
+  // "(NASDAQ:AMZN)". They are metadata, not part of the readable headline.
+  const trimmed = title
+    .replace(
+      /\s*\((?:(?:NYSE|NASDAQ|AMEX|OTC|LSE|TSX|FWB|BCS)\s*:[^)]+|[^():]+\s*:(?:NYSE|NASDAQ|AMEX|OTC|LSE|TSX|FWB|BCS))\)/gi,
+      ''
+    )
+    .replace(/\s{2,}/g, ' ')
+    .trim();
   const idx = trimmed.lastIndexOf(' - ');
   if (idx <= 0) return trimmed;
   return trimmed.slice(0, idx).trim() || trimmed;
@@ -414,8 +435,11 @@ async function fetchFinnhubNews(
   });
 }
 
-// Ranges shorter than this are covered by the live feeds; no backfill needed.
-const HISTORY_MIN_DAYS = 14;
+// A 5D chart needs dated coverage across the window: live feeds tend to return
+// only today's stories, which then collapse into a single chart marker. Skip
+// historical backfill only for genuinely short (1D/2D) requests. A 5D request
+// uses one bounded Google News window, cached for 12 hours.
+const HISTORY_MIN_DAYS = 2;
 // Bound the number of date windows per edition so a cold 1Y request stays fast.
 const HISTORY_MAX_WINDOWS = 4;
 
@@ -490,6 +514,34 @@ function selectSpreadAcrossRange(
   const to = range.to ?? new Date();
   const totalDays = from ? (to.getTime() - from.getTime()) / ONE_DAY_MS : 0;
 
+  // In the compact 5D view the chart can show only one marker per trading
+  // date. Return one genuine article per publication date as well, choosing
+  // the strongest relevance score for that day, so the Related News list and
+  // chart markers stay aligned instead of repeating several same-day stories.
+  if (from && totalDays <= 7) {
+    const bestByDay = new Map<string, NewsItem>();
+    for (const item of items) {
+      const timestamp = toTimestamp(item.isoDate ?? item.pubDate);
+      if (!timestamp) continue;
+
+      const day = toYmd(new Date(timestamp));
+      const current = bestByDay.get(day);
+      if (
+        !current ||
+        item.score > current.score ||
+        (item.score === current.score && timestamp > toTimestamp(current.isoDate ?? current.pubDate))
+      ) {
+        bestByDay.set(day, item);
+      }
+    }
+
+    // `now - 5 days` is inclusive at both ends and can span six calendar
+    // dates. Keep only the five newest daily representatives for a 5D request
+    // so an older weekend story does not collide with Monday's chart point.
+    const dailyLimit = Math.min(limit, Math.max(1, Math.ceil(totalDays)));
+    return [...bestByDay.values()].sort(byDateDesc).slice(0, dailyLimit);
+  }
+
   if (!from || totalDays <= HISTORY_MIN_DAYS || items.length <= limit) {
     return [...items].sort(byDateDesc).slice(0, limit);
   }
@@ -533,7 +585,15 @@ export async function fetchNewsForTicker(
   // minScore 3 drops items that only earned the base "search provenance" credit
   // (no keyword match at all) — e.g. legal bulletins that merely list the ticker.
   // requireFinancial drops brand-only mentions (sports/sponsorship/CSR).
-  const { companyName, limit = 20, minScore = 3, requireFinancial = true, enrich = false } = options;
+  const {
+    companyName,
+    limit = 20,
+    minScore = 3,
+    requireFinancial = true,
+    rssOnly = false,
+    enrich = false,
+    language = 'en',
+  } = options;
 
   const profile = await resolveCompanyProfile(ticker, companyName);
   const dateRange = resolveDateRange(options);
@@ -544,9 +604,11 @@ export async function fetchNewsForTicker(
     newsCache.getOrSet(`rss|${profile.ticker}|${profile.companyName}`, () =>
       fetchFromQuerySources(profile)
     ),
-    newsCache.getOrSet(`yahoo|${profile.ticker}`, () => fetchYahooSearchNews(profile)),
-    fetchHistoricalGoogleNews(profile, dateRange),
-    fetchFinnhubNews(profile, dateRange),
+    rssOnly
+      ? Promise.resolve([])
+      : newsCache.getOrSet(`yahoo|${profile.ticker}`, () => fetchYahooSearchNews(profile)),
+    rssOnly ? Promise.resolve([]) : fetchHistoricalGoogleNews(profile, dateRange),
+    rssOnly ? Promise.resolve([]) : fetchFinnhubNews(profile, dateRange),
   ]);
 
   const filtered = [...rssNews, ...yahooNews, ...googleHistory, ...finnhubNews].filter(
@@ -559,12 +621,22 @@ export async function fetchNewsForTicker(
   );
 
   const deduped = dedupeNews(filtered);
-  const top = selectSpreadAcrossRange(deduped, dateRange, limit);
+  // The live RSS panel should show every qualifying article from today (up to
+  // its limit). Daily collapsing is only for historical chart-marker data.
+  const top = rssOnly
+    ? [...deduped]
+        .sort(
+          (a, b) =>
+            toTimestamp(b.isoDate ?? b.pubDate) - toTimestamp(a.isoDate ?? a.pubDate) ||
+            b.score - a.score
+        )
+        .slice(0, limit)
+    : selectSpreadAcrossRange(deduped, dateRange, limit);
 
   if (enrich) {
     // Enrich the freshest slice with AI; return the rest unchanged so longer
     // timeframes still get a full spread of (neutral) dated markers.
-    const enriched = await enrichNewsItems(top.slice(0, MAX_ENRICH_PER_REQUEST));
+    const enriched = await enrichNewsItems(top.slice(0, MAX_ENRICH_PER_REQUEST), language);
     return [...enriched, ...top.slice(MAX_ENRICH_PER_REQUEST)];
   }
 
