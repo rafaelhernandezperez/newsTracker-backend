@@ -106,7 +106,8 @@ async function processTicker(
   const enrichments = await enrichNewsBatch(
     fresh.map(([, item]) => ({
       text: `${item.title}. ${item.summary ?? ""}`,
-      fallbackSummary: item.summary ?? "",
+      targetLanguage: "en",
+      fallbackSummary: item.language === "en" ? item.summary ?? "" : "",
     }))
   );
 
