@@ -9,6 +9,7 @@ import watchlistRouter from "./routes/watchlist.js";
 import devicesRouter from "./routes/devices.js";
 import preferencesRouter from "./routes/preferences.js";
 import { requireAuth } from "./middleware/auth.js";
+import { hfToken } from "./config/secrets.js";
 
 const app = express();
 
@@ -41,6 +42,7 @@ export const api = onRequest(
     region: "europe-west1",
     // Caps runaway scale-out (and with it, external API + LLM spend).
     maxInstances: 5,
+    secrets: [hfToken],
   },
   app
 );

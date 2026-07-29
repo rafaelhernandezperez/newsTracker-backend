@@ -1,6 +1,7 @@
 import { onSchedule } from "firebase-functions/v2/scheduler";
 import { runTrackingCycle, runPriceAlertCycle } from "../services/trackerService/trackerService";
 import { runDailyDigestCycle } from "../services/digestService/digestService";
+import { hfToken } from "../config/secrets";
 
 /**
  * News tracker. Runs every 15 minutes to keep the enriched news store + history
@@ -17,6 +18,7 @@ export const trackNews = onSchedule(
     memory: "512MiB",
     // Avoid overlapping runs piling up if a cycle runs long.
     retryCount: 0,
+    secrets: [hfToken],
   },
   async () => {
     await runTrackingCycle();
@@ -37,6 +39,7 @@ export const dailyDigest = onSchedule(
     timeoutSeconds: 540,
     memory: "512MiB",
     retryCount: 0,
+    secrets: [hfToken],
   },
   async () => {
     await runDailyDigestCycle();

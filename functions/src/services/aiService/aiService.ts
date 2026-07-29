@@ -3,13 +3,12 @@ import axios, { AxiosError } from 'axios';
 const HUGGING_FACE_CHAT_URL = 'https://router.huggingface.co/v1/chat/completions';
 
 /**
- * Primary model: Llama 3.3 70B Instruct — strong instruction-following and
- * reliable JSON output, widely provisioned across HF inference providers.
+ * Primary model: Llama 3.1 8B Instruct.
  * Override with HF_MODEL. If the primary is unavailable (404/403 for the model,
  * provider outage), the fallback is tried before giving up.
  */
-const DEFAULT_MODEL = 'meta-llama/Llama-3.3-70B-Instruct';
-const FALLBACK_MODEL = 'Qwen/Qwen2.5-72B-Instruct';
+const DEFAULT_MODEL = 'meta-llama/Llama-3.1-8B-Instruct';
+const FALLBACK_MODEL = 'Qwen/Qwen3.5-4B';
 
 const SENTIMENT_VALUES = ['POSITIVO', 'NEGATIVO', 'NEUTRO'] as const;
 const IMPORTANCE_VALUES = [
@@ -29,6 +28,10 @@ type HuggingFaceChatResponse = {
     };
   }>;
 };
+
+function aiDebugLogsEnabled(): boolean {
+  return process.env.AI_DEBUG_LOGS?.trim().toLowerCase() === 'true';
+}
 
 function getHuggingFaceToken(): string {
   const token = process.env.HF_TOKEN?.trim() || process.env.HUGGINGFACE_API_KEY?.trim();
@@ -61,23 +64,34 @@ function isRetryable(error: unknown): boolean {
 }
 
 async function callModel(model: string, prompt: string, maxTokens: number): Promise<string> {
+  const requestBody = {
+    model,
+    messages: [
+      {
+        role: 'system',
+        content:
+          'Eres un analista financiero senior. Clasificas noticias para inversores ' +
+          'particulares. Respondes SIEMPRE con JSON valido y nada mas.',
+      },
+      { role: 'user', content: prompt },
+    ],
+    max_tokens: maxTokens,
+    temperature: 0.1,
+    stream: false,
+  };
+
+  if (aiDebugLogsEnabled()) {
+    // Intentionally logs the exact model input for temporary evaluation runs.
+    // Authentication headers/tokens are never included.
+    console.log('[aiService][debug] REQUEST', JSON.stringify({
+      endpoint: HUGGING_FACE_CHAT_URL,
+      body: requestBody,
+    }));
+  }
+
   const response = await axios.post<HuggingFaceChatResponse>(
     HUGGING_FACE_CHAT_URL,
-    {
-      model,
-      messages: [
-        {
-          role: 'system',
-          content:
-            'Eres un analista financiero senior. Clasificas noticias para inversores ' +
-            'particulares. Respondes SIEMPRE con JSON valido y nada mas.',
-        },
-        { role: 'user', content: prompt },
-      ],
-      max_tokens: maxTokens,
-      temperature: 0.1,
-      stream: false,
-    },
+    requestBody,
     {
       headers: {
         Authorization: `Bearer ${getHuggingFaceToken()}`,
@@ -90,6 +104,14 @@ async function callModel(model: string, prompt: string, maxTokens: number): Prom
   const content = response.data.choices?.[0]?.message?.content?.trim();
   if (!content) {
     throw new Error('Hugging Face returned an empty AI response');
+  }
+
+  if (aiDebugLogsEnabled()) {
+    // Keep this raw: do not parse, normalize, or extract JSON before logging.
+    console.log('[aiService][debug] RAW_RESPONSE', JSON.stringify({
+      model,
+      content,
+    }));
   }
 
   return content;
@@ -120,6 +142,7 @@ async function runPrompt(prompt: string, maxTokens: number): Promise<string> {
 }
 
 export type NewsEnrichment = {
+  localizedTitle: string;
   summary: string;
   sentiment: Sentiment;
   importance: Importance;
@@ -128,9 +151,22 @@ export type NewsEnrichment = {
 export type EnrichmentInput = {
   /** Headline + snippet handed to the model. */
   text: string;
+  /** Language in which the generated summary must be written. */
+  targetLanguage?: 'en' | 'es';
   /** Used when the model produces no usable summary for this item. */
   fallbackSummary?: string;
 };
+
+/** Canonicalize separators and accents in a classification returned by an LLM. */
+export function normalizeClassificationLabel(raw: string | undefined): string {
+  return (raw ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
 
 /** Normalize a raw model string to one of the allowed enum values. */
 function coerceEnum<T extends string>(
@@ -138,7 +174,11 @@ function coerceEnum<T extends string>(
   allowed: readonly T[],
   fallback: T
 ): T {
-  const cleaned = (raw ?? '').toUpperCase().replace(/[^A-Z_ÁÉÍÓÚÑ]/g, '');
+  // Models do not always preserve the exact separator requested by the
+  // prompt. For example, "MUY IMPORTANTE" and "POCO-RELEVANTE" are valid
+  // semantic answers, but the previous implementation removed the separator
+  // entirely (MUYIMPORTANTE) and silently downgraded them to NEUTRO.
+  const cleaned = normalizeClassificationLabel(raw);
   return (allowed as readonly string[]).includes(cleaned) ? (cleaned as T) : fallback;
 }
 
@@ -149,7 +189,13 @@ function coerceEnum<T extends string>(
  */
 const CLASSIFICATION_RUBRIC =
   'Para cada noticia devuelve:\n' +
-  '- "summary": resumen de UNA frase en español (max 30 palabras).\n' +
+  '- "summary": una frase informativa de entre 25 y 45 palabras en el idioma indicado. ' +
+  'Debe explicar el hecho principal y, cuando el texto lo permita, añadir una cifra, contexto ' +
+  'o consecuencia relevante para el inversor. No copies, traduzcas ni reformules simplemente ' +
+  'el titular. No añadas datos que no estén en la noticia y no mezcles idiomas.\n' +
+  '- "localizedTitle": traduccion fiel del titular al idioma indicado. Conserva nombres propios, ' +
+  'tickers, cifras y significado; no añadas informacion. Omite anotaciones de bolsa entre ' +
+  'parentesis como (NYSE:IBM) o (NASDAQ:AMZN).\n' +
   '- "importancia", segun el impacto potencial en la cotizacion de la empresa:\n' +
   '  * MUY_IMPORTANTE: resultados trimestrales/anuales, fusiones/adquisiciones/OPA, ' +
   'profit warning, cambio de guidance, sancion o fallo regulatorio/judicial relevante, ' +
@@ -162,12 +208,18 @@ const CLASSIFICATION_RUBRIC =
   '- "sentimiento": efecto esperado para el accionista: POSITIVO, NEGATIVO o NEUTRO.\n';
 
 function neutralEnrichment(fallbackSummary = ''): NewsEnrichment {
-  return { summary: fallbackSummary, sentiment: 'NEUTRO', importance: 'NEUTRO' };
+  return {
+    localizedTitle: '',
+    summary: fallbackSummary,
+    sentiment: 'NEUTRO',
+    importance: 'NEUTRO',
+  };
 }
 
 function parseEnrichment(
   parsed: {
     summary?: string;
+    localizedTitle?: string;
     importancia?: string;
     sentimiento?: string;
     // Tolerate English keys in case the model ignores the schema.
@@ -177,6 +229,7 @@ function parseEnrichment(
   fallbackSummary: string
 ): NewsEnrichment {
   return {
+    localizedTitle: parsed.localizedTitle?.trim() || '',
     summary: parsed.summary?.trim() || fallbackSummary,
     importance: coerceEnum(parsed.importancia ?? parsed.importance, IMPORTANCE_VALUES, 'NEUTRO'),
     sentiment: coerceEnum(parsed.sentimiento ?? parsed.sentiment, SENTIMENT_VALUES, 'NEUTRO'),
@@ -209,7 +262,10 @@ export async function enrichNewsBatch(
 
 async function enrichChunk(chunk: EnrichmentInput[]): Promise<Array<NewsEnrichment | null>> {
   const numbered = chunk
-    .map((item, i) => `${i + 1}. ${item.text.replace(/\s+/g, ' ').slice(0, 600)}`)
+    .map((item, i) => {
+      const language = item.targetLanguage === 'es' ? 'español' : 'inglés';
+      return `${i + 1}. [idioma: ${language}] ${item.text.replace(/\s+/g, ' ').slice(0, 600)}`;
+    })
     .join('\n');
 
   try {
@@ -218,7 +274,8 @@ async function enrichChunk(chunk: EnrichmentInput[]): Promise<Array<NewsEnrichme
         CLASSIFICATION_RUBRIC +
         'Devuelve SOLO un array JSON con un objeto por noticia, en el MISMO orden, ' +
         'con esta forma exacta:\n' +
-        '[{"id": 1, "summary": "...", "importancia": "...", "sentimiento": "..."}, ...]\n\n' +
+        '[{"id": 1, "localizedTitle": "...", "summary": "...", ' +
+        '"importancia": "...", "sentimiento": "..."}, ...]\n\n' +
         'Noticias:\n' +
         numbered,
       160 * chunk.length
@@ -229,6 +286,7 @@ async function enrichChunk(chunk: EnrichmentInput[]): Promise<Array<NewsEnrichme
       const parsed = JSON.parse(match[0]) as Array<{
         id?: number;
         summary?: string;
+        localizedTitle?: string;
         importancia?: string;
         sentimiento?: string;
         importance?: string;
@@ -262,8 +320,9 @@ async function enrichChunk(chunk: EnrichmentInput[]): Promise<Array<NewsEnrichme
  */
 export async function enrichNews(
   text: string,
-  fallbackSummary = ''
+  fallbackSummary = '',
+  targetLanguage: 'en' | 'es' = 'en'
 ): Promise<NewsEnrichment | null> {
-  const [result] = await enrichNewsBatch([{ text, fallbackSummary }]);
+  const [result] = await enrichNewsBatch([{ text, fallbackSummary, targetLanguage }]);
   return result ?? null;
 }
