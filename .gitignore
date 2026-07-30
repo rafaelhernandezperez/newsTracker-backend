@@ -3,3 +3,6 @@ serviceAccountKey.json
 functions/node_modules
 .DS_Store
 functions/serviceAccount.json
+
+# Thesis drafts and internal docs — local only, never pushed
+docs/
