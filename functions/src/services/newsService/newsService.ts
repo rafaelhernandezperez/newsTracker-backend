@@ -37,12 +37,21 @@ const FINNHUB_COMPANY_NEWS_URL = 'https://finnhub.io/api/v1/company-news';
 // so they can be cached much longer than the live feeds.
 const googleHistoryCache = new TtlCache<NewsItem[]>(12 * 60 * 60 * 1000);
 
-// AI classification of a given story is stable, so it's cached far longer than
-// the feed results and keyed by the item's stable id. This keeps repeated
-// on-demand requests cheap and bounds LLM calls.
-const enrichmentCache = new TtlCache<{
+// AI output for a given story is stable, so it's cached far longer than the feed
+// results. Two caches, because the two halves have different scopes:
+//
+//  - importance/sentiment describe the story itself and do not depend on the
+//    reader's language, so they are keyed by the item id alone. Sharing them
+//    across languages means switching language can't downgrade a classified
+//    story back to "unclassified" (which would also flatten its chart marker).
+//  - the translated headline and summary are per language, so they are keyed by
+//    item id AND language.
+const classificationCache = new TtlCache<{
   importance: NonNullable<NewsItem['importance']>;
   sentiment: NonNullable<NewsItem['sentiment']>;
+}>(6 * 60 * 60 * 1000);
+
+const localizedCache = new TtlCache<{
   localizedTitle?: string;
   aiSummary?: string;
 }>(6 * 60 * 60 * 1000);
@@ -69,16 +78,19 @@ type FetchNewsOptions = {
 };
 
 /**
- * Attach AI importance + sentiment + summary to each item. Cached per item id;
- * uncached items are classified in batched LLM calls. On failure items are
- * returned unchanged (markers then fall back to a neutral size/color).
+ * Attach AI importance + sentiment + a headline and summary written in
+ * `language` to each item. Items missing a translation for this language are
+ * sent to the batched LLM calls; anything that fails is returned unchanged, so
+ * the caller can tell "not classified" from "classified as neutral".
  */
 export async function enrichNewsItems(
   items: NewsItem[],
   language: 'en' | 'es' = 'en'
 ): Promise<NewsItem[]> {
-  const cacheKey = (item: NewsItem): string => `${item.id}|${language}`;
-  const pending = items.filter((item) => !enrichmentCache.get(cacheKey(item)));
+  const localizedKey = (item: NewsItem): string => `${item.id}|${language}`;
+  // Keyed on the localized half: an item classified in another language still
+  // needs a call to get its headline and summary in THIS language.
+  const pending = items.filter((item) => !localizedCache.get(localizedKey(item)));
 
   if (pending.length > 0) {
     try {
@@ -95,9 +107,11 @@ export async function enrichNewsItems(
         // null = enrichment failed for this item; leave it uncached so a later
         // request retries instead of freezing a fake NEUTRO for 6 hours.
         if (!enrichment) return;
-        enrichmentCache.set(cacheKey(pending[i]), {
+        classificationCache.set(pending[i].id, {
           importance: enrichment.importance,
           sentiment: enrichment.sentiment,
+        });
+        localizedCache.set(localizedKey(pending[i]), {
           localizedTitle: enrichment.localizedTitle || undefined,
           aiSummary: enrichment.summary || undefined,
         });
@@ -108,8 +122,14 @@ export async function enrichNewsItems(
   }
 
   return items.map((item) => {
-    const enrichment = enrichmentCache.get(cacheKey(item));
-    return enrichment ? { ...item, ...enrichment } : item;
+    const classification = classificationCache.get(item.id);
+    const localized = localizedCache.get(localizedKey(item));
+
+    if (!classification && !localized) {
+      return item;
+    }
+
+    return { ...item, ...classification, ...localized };
   });
 }
 

@@ -51,6 +51,48 @@ const RETRYABLE_NETWORK_CODES = new Set([
   'ERR_NETWORK',
 ]);
 
+/**
+ * One-line description of a failed model call: HTTP status plus whatever the
+ * provider said. The raw axios error is thousands of lines of socket state, so
+ * without this the actual cause (bad token, gated model, rate limit, TLS) never
+ * makes it into the logs.
+ */
+function describeError(error: unknown): string {
+  const axiosError = error as AxiosError<unknown>;
+  const status = axiosError?.response?.status;
+  const parts = [status ? `HTTP ${status}` : (axiosError?.code ?? 'no response')];
+
+  const provider = providerMessage(axiosError?.response?.data);
+  parts.push(provider ?? axiosError?.message ?? String(error));
+
+  return parts.join(' — ');
+}
+
+/** Pull the human-readable message out of the provider's error body. */
+function providerMessage(body: unknown): string | undefined {
+  if (typeof body === 'string') {
+    return body.slice(0, 300);
+  }
+
+  if (!body || typeof body !== 'object') {
+    return undefined;
+  }
+
+  const error = (body as { error?: unknown }).error;
+  if (typeof error === 'string') {
+    return error.slice(0, 300);
+  }
+  if (error && typeof error === 'object') {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === 'string') {
+      return message.slice(0, 300);
+    }
+  }
+
+  const message = (body as { message?: unknown }).message;
+  return typeof message === 'string' ? message.slice(0, 300) : undefined;
+}
+
 function isRetryable(error: unknown): boolean {
   const axiosError = error as AxiosError;
   const status = axiosError?.response?.status;
@@ -132,6 +174,9 @@ async function runPrompt(prompt: string, maxTokens: number): Promise<string> {
         return await callModel(model, prompt, maxTokens);
       } catch (error) {
         lastError = error;
+        console.warn(
+          `[aiService] ${model} attempt ${attempt + 1} failed: ${describeError(error)}`
+        );
         if (!isRetryable(error)) break; // model/auth problem: skip to fallback model
         await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
       }
@@ -240,6 +285,12 @@ function parseEnrichment(
 // (40 items = 5 calls) without the response growing past max_tokens.
 const BATCH_SIZE = 8;
 
+// Token budget per item in a batch. A localized title plus a 25-45 word summary
+// in Spanish runs longer than in English; too small a budget truncates the JSON
+// array mid-answer, which used to discard the whole batch (no translated titles,
+// no classification) rather than just the tail.
+const MAX_TOKENS_PER_ITEM = 230;
+
 /**
  * Classify a batch of news items (summary + importance + sentiment) using ONE
  * LLM call per BATCH_SIZE items. Returns one entry per input, in order; items
@@ -268,8 +319,9 @@ async function enrichChunk(chunk: EnrichmentInput[]): Promise<Array<NewsEnrichme
     })
     .join('\n');
 
+  let raw: string;
   try {
-    const raw = await runPrompt(
+    raw = await runPrompt(
       'Analiza estas noticias financieras.\n' +
         CLASSIFICATION_RUBRIC +
         'Devuelve SOLO un array JSON con un objeto por noticia, en el MISMO orden, ' +
@@ -278,40 +330,82 @@ async function enrichChunk(chunk: EnrichmentInput[]): Promise<Array<NewsEnrichme
         '"importancia": "...", "sentimiento": "..."}, ...]\n\n' +
         'Noticias:\n' +
         numbered,
-      160 * chunk.length
+      MAX_TOKENS_PER_ITEM * chunk.length
     );
-
-    const match = raw.match(/\[[\s\S]*\]/);
-    if (match) {
-      const parsed = JSON.parse(match[0]) as Array<{
-        id?: number;
-        summary?: string;
-        localizedTitle?: string;
-        importancia?: string;
-        sentimiento?: string;
-        importance?: string;
-        sentiment?: string;
-      }>;
-
-      if (Array.isArray(parsed)) {
-        return chunk.map((item, i) => {
-          // Prefer matching by the echoed id; fall back to position. A missing
-          // entry means the model answered but skipped this item — treat its
-          // classification as genuinely neutral rather than failed.
-          const entry = parsed.find((p) => p.id === i + 1) ?? parsed[i];
-          return entry
-            ? parseEnrichment(entry, item.fallbackSummary ?? '')
-            : neutralEnrichment(item.fallbackSummary);
-        });
-      }
-    }
-    console.warn('[aiService] enrichChunk: response contained no JSON array');
   } catch (error) {
-    console.warn('[aiService] enrichChunk failed:', error);
+    // Transport/auth/model failure: every attempt and both models are already
+    // exhausted, and splitting the batch would only repeat it. Signal failure so
+    // callers skip caching and a later request retries.
+    console.warn(
+      `[aiService] enrichChunk: model call failed for ${chunk.length} item(s) — ` +
+        describeError(error)
+    );
+    return chunk.map(() => null);
   }
 
-  // Signal failure so callers skip caching/persisting and retry later.
+  const parsed = parseEnrichmentArray(raw);
+  if (parsed) {
+    return chunk.map((item, i) => {
+      // Prefer matching by the echoed id; fall back to position. A missing
+      // entry means the model answered but skipped this item — treat its
+      // classification as genuinely neutral rather than failed.
+      const entry = parsed.find((p) => p.id === i + 1) ?? parsed[i];
+      return entry
+        ? parseEnrichment(entry, item.fallbackSummary ?? '')
+        : neutralEnrichment(item.fallbackSummary);
+    });
+  }
+
+  // The model answered, but the JSON was unusable — typically truncated at
+  // max_tokens. Halve the batch and retry: a single bad response used to cost
+  // every item in it its translation and classification. Recursion bottoms out
+  // at one item, so the worst case loses only that item.
+  if (chunk.length > 1) {
+    const middle = Math.ceil(chunk.length / 2);
+    console.warn(
+      `[aiService] enrichChunk: unusable response for ${chunk.length} items, splitting`
+    );
+    const [first, second] = await Promise.all([
+      enrichChunk(chunk.slice(0, middle)),
+      enrichChunk(chunk.slice(middle)),
+    ]);
+    return [...first, ...second];
+  }
+
+  console.warn('[aiService] enrichChunk: unusable response for a single item');
   return chunk.map(() => null);
+}
+
+type RawEnrichmentEntry = {
+  id?: number;
+  summary?: string;
+  localizedTitle?: string;
+  importancia?: string;
+  sentimiento?: string;
+  // Tolerate English keys in case the model ignores the schema.
+  importance?: string;
+  sentiment?: string;
+};
+
+/**
+ * The JSON array out of a model answer, or null when it isn't usable. An empty
+ * array counts as unusable: caching a NEUTRO with no translated title for every
+ * item in the batch is worse than retrying.
+ */
+function parseEnrichmentArray(raw: string): RawEnrichmentEntry[] | null {
+  const match = raw.match(/\[[\s\S]*\]/);
+  if (!match) {
+    return null;
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(match[0]);
+    return Array.isArray(parsed) && parsed.length > 0
+      ? (parsed as RawEnrichmentEntry[])
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
