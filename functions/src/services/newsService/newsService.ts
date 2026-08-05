@@ -14,7 +14,9 @@ import { enrichNewsBatch } from '../aiService/aiService';
 import type { CompanyProfile, NewsItem } from './types';
 
 const parser = new Parser({
-  timeout: 12000,
+  // One stalled feed should not hold an interactive request for 12 seconds;
+  // other sources still provide coverage when this bounded call times out.
+  timeout: 7000,
   headers: {
     'User-Agent':
       'Mozilla/5.0 (compatible; financial-news-tracker/2.0; +https://example.com/bot)',
@@ -37,6 +39,12 @@ const FINNHUB_COMPANY_NEWS_URL = 'https://finnhub.io/api/v1/company-news';
 // so they can be cached much longer than the live feeds.
 const googleHistoryCache = new TtlCache<NewsItem[]>(12 * 60 * 60 * 1000);
 
+<<<<<<< HEAD
+// AI classification of a given story is stable, so it's cached far longer than
+// the feed results and keyed by the item's stable id. This keeps repeated
+// on-demand requests cheap and bounds LLM calls.
+const enrichmentCache = new TtlCache<{
+=======
 // AI output for a given story is stable, so it's cached far longer than the feed
 // results. Two caches, because the two halves have different scopes:
 //
@@ -47,10 +55,21 @@ const googleHistoryCache = new TtlCache<NewsItem[]>(12 * 60 * 60 * 1000);
 //  - the translated headline and summary are per language, so they are keyed by
 //    item id AND language.
 const classificationCache = new TtlCache<{
+>>>>>>> 2cd3cbecae98bdd06938813ab28209f983779eaf
   importance: NonNullable<NewsItem['importance']>;
   sentiment: NonNullable<NewsItem['sentiment']>;
+  localizedTitle?: string;
+  aiSummary?: string;
 }>(6 * 60 * 60 * 1000);
+// Coalesce overlapping requests (dashboard/detail, language refreshes, or two
+// clients hitting the same story) instead of paying for duplicate model calls.
+const enrichmentPending = new Map<string, Promise<void>>();
 
+<<<<<<< HEAD
+// Increment when localization prompting/validation changes so a hot process
+// cannot reuse an earlier wrong-language enrichment under the same lang key.
+const LOCALIZATION_CACHE_VERSION = 'v2';
+=======
 const localizedCache = new TtlCache<{
   localizedTitle?: string;
   aiSummary?: string;
@@ -59,6 +78,7 @@ const localizedCache = new TtlCache<{
 // Bound how many items we send to the LLM per request. Classification is
 // batched (several items per call), so this stays responsive even at 40.
 const MAX_ENRICH_PER_REQUEST = 40;
+>>>>>>> 2cd3cbecae98bdd06938813ab28209f983779eaf
 
 type FetchNewsOptions = {
   companyName?: string;
@@ -75,6 +95,17 @@ type FetchNewsOptions = {
   enrich?: boolean;
   /** Language used for every AI summary returned to the interface. */
   language?: 'en' | 'es';
+<<<<<<< HEAD
+  /** Optional fast-path filter for articles already written in this language. */
+  sourceLanguage?: 'en' | 'es';
+};
+
+/**
+ * Attach AI importance + sentiment and localize the display title/summary.
+ * Cached per item id and requested language. Uncached items are classified in
+ * batched LLM calls. On failure, same-language source items remain usable;
+ * cross-language items are omitted so untranslated text cannot leak into UI.
+=======
 };
 
 /**
@@ -82,11 +113,97 @@ type FetchNewsOptions = {
  * `language` to each item. Items missing a translation for this language are
  * sent to the batched LLM calls; anything that fails is returned unchanged, so
  * the caller can tell "not classified" from "classified as neutral".
+>>>>>>> 2cd3cbecae98bdd06938813ab28209f983779eaf
  */
 export async function enrichNewsItems(
   items: NewsItem[],
   language: 'en' | 'es' = 'en'
 ): Promise<NewsItem[]> {
+<<<<<<< HEAD
+  const cacheKey = (item: NewsItem): string =>
+    `${LOCALIZATION_CACHE_VERSION}|${item.id}|${language}`;
+  const uncached = items.filter((item) => {
+    const key = cacheKey(item);
+    return !enrichmentCache.get(key) && !enrichmentPending.has(key);
+  });
+
+  if (uncached.length > 0) {
+    const work = (async (): Promise<void> => {
+      try {
+        const enrichments = await enrichNewsBatch(
+          uncached.map((item) => ({
+            text: `${item.title}. ${item.summary ?? ''}`,
+            targetLanguage: language,
+            // Never fall back to a source-language snippet that would make the
+            // interface mix English and Spanish.
+            fallbackSummary: item.language === language ? item.summary ?? '' : '',
+          }))
+        );
+        enrichments.forEach((enrichment, i) => {
+          // null = enrichment failed for this item; leave it uncached so a later
+          // request retries instead of freezing a fake NEUTRO for 6 hours.
+          if (!enrichment) return;
+          enrichmentCache.set(cacheKey(uncached[i]), {
+            importance: enrichment.importance,
+            sentiment: enrichment.sentiment,
+            localizedTitle: enrichment.localizedTitle || undefined,
+            aiSummary: enrichment.summary || undefined,
+          });
+        });
+      } catch (error) {
+        console.warn('[newsService] batch enrichment failed:', error);
+      }
+    })();
+
+    for (const item of uncached) {
+      enrichmentPending.set(cacheKey(item), work);
+    }
+
+    void work.finally(() => {
+      for (const item of uncached) {
+        const key = cacheKey(item);
+        if (enrichmentPending.get(key) === work) {
+          enrichmentPending.delete(key);
+        }
+      }
+    });
+  }
+
+  // Wait for both the work started above and matching work already started by
+  // another request. Set removes duplicates when several items share a batch.
+  await Promise.all(
+    [...new Set(items.map((item) => enrichmentPending.get(cacheKey(item))).filter(
+      (promise): promise is Promise<void> => promise !== undefined
+    ))]
+  );
+
+  return items.flatMap((item) => {
+    const enrichment = enrichmentCache.get(cacheKey(item));
+    if (!enrichment) {
+      // Never leak an untranslated source item into an interface using the
+      // other language. A later request will retry because failures are not
+      // cached; meanwhile the caller can choose another qualifying story.
+      return item.language === language ? [item] : [];
+    }
+
+    const localizedTitle = enrichment.localizedTitle?.trim();
+    const localizedSummary = enrichment.aiSummary?.trim();
+
+    return [{
+      ...item,
+      ...enrichment,
+      // `title` and `summary` are the fields consumed by news cards. Returning
+      // translations only in auxiliary fields left those cards in the source
+      // language, despite the request's `lang` value.
+      title: localizedTitle || item.title,
+      summary:
+        localizedSummary || (item.language === language ? item.summary : undefined),
+      language,
+      sourceLanguage: item.language,
+      originalTitle: item.title,
+      originalSummary: item.summary,
+    }];
+=======
   const localizedKey = (item: NewsItem): string => `${item.id}|${language}`;
   // Keyed on the localized half: an item classified in another language still
   // needs a call to get its headline and summary in THIS language.
@@ -130,6 +247,7 @@ export async function enrichNewsItems(
     }
 
     return { ...item, ...classification, ...localized };
+>>>>>>> 2cd3cbecae98bdd06938813ab28209f983779eaf
   });
 }
 
@@ -613,6 +731,10 @@ export async function fetchNewsForTicker(
     rssOnly = false,
     enrich = false,
     language = 'en',
+<<<<<<< HEAD
+    sourceLanguage,
+=======
+>>>>>>> 2cd3cbecae98bdd06938813ab28209f983779eaf
   } = options;
 
   const profile = await resolveCompanyProfile(ticker, companyName);
@@ -635,6 +757,7 @@ export async function fetchNewsForTicker(
     (item) =>
       item.link &&
       item.title &&
+      (!sourceLanguage || item.language === sourceLanguage) &&
       item.score >= minScore &&
       (!requireFinancial || item.isFinancial) &&
       isWithinDateRange(item, dateRange)
@@ -654,10 +777,18 @@ export async function fetchNewsForTicker(
     : selectSpreadAcrossRange(deduped, dateRange, limit);
 
   if (enrich) {
+<<<<<<< HEAD
+    // Every returned item must be localized. Previously only the freshest 40
+    // were enriched, so older Spanish-source stories leaked Spanish titles and
+    // summaries into an English interface. enrichNewsItems already sends work
+    // to the model in bounded batches and caches it per story + language.
+    return enrichNewsItems(top, language);
+=======
     // Enrich the freshest slice with AI; return the rest unchanged so longer
     // timeframes still get a full spread of (neutral) dated markers.
     const enriched = await enrichNewsItems(top.slice(0, MAX_ENRICH_PER_REQUEST), language);
     return [...enriched, ...top.slice(MAX_ENRICH_PER_REQUEST)];
+>>>>>>> 2cd3cbecae98bdd06938813ab28209f983779eaf
   }
 
   return top;

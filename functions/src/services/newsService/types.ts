@@ -13,6 +13,12 @@ export type NewsItem = {
   pubDate?: string | undefined;
   isoDate?: string | undefined;
   language?: string | undefined;
+  /** Language of the unmodified source article. */
+  sourceLanguage?: string | undefined;
+  /** Source headline retained when `title` is localized for display. */
+  originalTitle?: string;
+  /** Source snippet retained when `summary` is localized for display. */
+  originalSummary?: string;
   matchedTickers: string[];
   score: number;
   /** True if the story contains genuine financial/market terms (not brand-only mentions). */

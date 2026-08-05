@@ -63,6 +63,10 @@ router.get('/:ticker', async (req: Request, res: Response) => {
         ? parsedDaysBack
         : undefined;
     const rssOnly = getQueryString(req.query.rssOnly)?.toLowerCase() === 'true';
+<<<<<<< HEAD
+    const enrich = getQueryString(req.query.enrich)?.toLowerCase() !== 'false';
+=======
+>>>>>>> 2cd3cbecae98bdd06938813ab28209f983779eaf
     const requestedLanguage =
       getQueryString(req.query.lang) ?? getQueryString(req.query.language) ?? 'en';
     if (requestedLanguage !== 'en' && requestedLanguage !== 'es') {
@@ -71,6 +75,24 @@ router.get('/:ticker', async (req: Request, res: Response) => {
         message: 'Language must be "en" or "es"',
       });
     }
+<<<<<<< HEAD
+    const requestedSourceLanguage = getQueryString(req.query.sourceLanguage);
+    if (
+      requestedSourceLanguage &&
+      requestedSourceLanguage !== 'en' &&
+      requestedSourceLanguage !== 'es'
+    ) {
+      return res.status(400).json({
+        ok: false,
+        message: 'Source language must be "en" or "es"',
+      });
+    }
+    const sourceLanguage: 'en' | 'es' | undefined =
+      requestedSourceLanguage === 'en' || requestedSourceLanguage === 'es'
+        ? requestedSourceLanguage
+        : undefined;
+=======
+>>>>>>> 2cd3cbecae98bdd06938813ab28209f983779eaf
 
     const news = await fetchNewsForTicker(ticker, {
       companyName,
@@ -82,8 +104,14 @@ router.get('/:ticker', async (req: Request, res: Response) => {
       rssOnly,
       // Attach AI importance + sentiment so the frontend chart can size/color
       // its news markers. Cached per item, so repeat requests stay cheap.
+<<<<<<< HEAD
+      enrich,
+      language: requestedLanguage,
+      sourceLanguage,
+=======
       enrich: true,
       language: requestedLanguage,
+>>>>>>> 2cd3cbecae98bdd06938813ab28209f983779eaf
     });
 
     return res.json({
