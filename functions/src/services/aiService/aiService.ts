@@ -1,5 +1,4 @@
 import axios, { AxiosError } from 'axios';
-<<<<<<< HEAD
 import { appendFile } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -15,18 +14,6 @@ const AI_REQUEST_TIMEOUT_MS = 20_000;
  */
 const DEFAULT_MODEL = 'Qwen/Qwen3.5-4B:featherless-ai';
 const FALLBACK_MODEL = 'meta-llama/Llama-3.1-8B-Instruct';
-=======
-
-const HUGGING_FACE_CHAT_URL = 'https://router.huggingface.co/v1/chat/completions';
-
-/**
- * Primary model: Llama 3.1 8B Instruct.
- * Override with HF_MODEL. If the primary is unavailable (404/403 for the model,
- * provider outage), the fallback is tried before giving up.
- */
-const DEFAULT_MODEL = 'meta-llama/Llama-3.1-8B-Instruct';
-const FALLBACK_MODEL = 'Qwen/Qwen3.5-4B';
->>>>>>> 2cd3cbecae98bdd06938813ab28209f983779eaf
 
 const SENTIMENT_VALUES = ['POSITIVO', 'NEGATIVO', 'NEUTRO'] as const;
 const IMPORTANCE_VALUES = [
@@ -51,7 +38,6 @@ function aiDebugLogsEnabled(): boolean {
   return process.env.AI_DEBUG_LOGS?.trim().toLowerCase() === 'true';
 }
 
-<<<<<<< HEAD
 async function writeAiEvaluationLog(entry: {
   aiUsed: string;
   rawMessage: unknown;
@@ -68,8 +54,6 @@ async function writeAiEvaluationLog(entry: {
   }
 }
 
-=======
->>>>>>> 2cd3cbecae98bdd06938813ab28209f983779eaf
 function getHuggingFaceToken(): string {
   const token = process.env.HF_TOKEN?.trim() || process.env.HUGGINGFACE_API_KEY?.trim();
   if (!token) {
@@ -88,8 +72,6 @@ const RETRYABLE_NETWORK_CODES = new Set([
   'ERR_NETWORK',
 ]);
 
-<<<<<<< HEAD
-=======
 /**
  * One-line description of a failed model call: HTTP status plus whatever the
  * provider said. The raw axios error is thousands of lines of socket state, so
@@ -132,7 +114,6 @@ function providerMessage(body: unknown): string | undefined {
   return typeof message === 'string' ? message.slice(0, 300) : undefined;
 }
 
->>>>>>> 2cd3cbecae98bdd06938813ab28209f983779eaf
 function isRetryable(error: unknown): boolean {
   const axiosError = error as AxiosError;
   const status = axiosError?.response?.status;
@@ -146,23 +127,14 @@ function isRetryable(error: unknown): boolean {
 }
 
 async function callModel(model: string, prompt: string, maxTokens: number): Promise<string> {
-<<<<<<< HEAD
   const requestBody: Record<string, unknown> = {
-=======
-  const requestBody = {
->>>>>>> 2cd3cbecae98bdd06938813ab28209f983779eaf
     model,
     messages: [
       {
         role: 'system',
         content:
-<<<<<<< HEAD
           'You are a senior financial analyst and translator. Follow the requested output ' +
           'language for each item, regardless of the source language. Return valid JSON only.',
-=======
-          'Eres un analista financiero senior. Clasificas noticias para inversores ' +
-          'particulares. Respondes SIEMPRE con JSON valido y nada mas.',
->>>>>>> 2cd3cbecae98bdd06938813ab28209f983779eaf
       },
       { role: 'user', content: prompt },
     ],
@@ -171,22 +143,12 @@ async function callModel(model: string, prompt: string, maxTokens: number): Prom
     stream: false,
   };
 
-<<<<<<< HEAD
   // Qwen 3.5 reasons by default. For short translation/classification work,
   // thinking can consume the entire output allowance before JSON is emitted,
   // adding latency and forcing a fallback. Featherless forwards this standard
   // Qwen chat-template option to produce the answer directly.
   if (model.startsWith('Qwen/Qwen3.5-')) {
     requestBody.chat_template_kwargs = { enable_thinking: false };
-=======
-  if (aiDebugLogsEnabled()) {
-    // Intentionally logs the exact model input for temporary evaluation runs.
-    // Authentication headers/tokens are never included.
-    console.log('[aiService][debug] REQUEST', JSON.stringify({
-      endpoint: HUGGING_FACE_CHAT_URL,
-      body: requestBody,
-    }));
->>>>>>> 2cd3cbecae98bdd06938813ab28209f983779eaf
   }
 
   const response = await axios.post<HuggingFaceChatResponse>(
@@ -197,11 +159,7 @@ async function callModel(model: string, prompt: string, maxTokens: number): Prom
         Authorization: `Bearer ${getHuggingFaceToken()}`,
         'Content-Type': 'application/json',
       },
-<<<<<<< HEAD
       timeout: AI_REQUEST_TIMEOUT_MS,
-=======
-      timeout: 45000,
->>>>>>> 2cd3cbecae98bdd06938813ab28209f983779eaf
     }
   );
 
@@ -211,20 +169,12 @@ async function callModel(model: string, prompt: string, maxTokens: number): Prom
   }
 
   if (aiDebugLogsEnabled()) {
-<<<<<<< HEAD
     // Keep both the input and output raw for evaluation purposes.
     await writeAiEvaluationLog({
       aiUsed: model,
       rawMessage: requestBody.messages,
       results: content,
     });
-=======
-    // Keep this raw: do not parse, normalize, or extract JSON before logging.
-    console.log('[aiService][debug] RAW_RESPONSE', JSON.stringify({
-      model,
-      content,
-    }));
->>>>>>> 2cd3cbecae98bdd06938813ab28209f983779eaf
   }
 
   return content;
@@ -234,7 +184,6 @@ async function callModel(model: string, prompt: string, maxTokens: number): Prom
  * Run a prompt against the configured model with one retry on transient errors,
  * then against the fallback model before giving up.
  */
-<<<<<<< HEAD
 type ModelResponse = { content: string; model: string };
 
 function configuredModels(): string[] {
@@ -247,36 +196,23 @@ async function runPrompt(
   maxTokens: number,
   models = configuredModels()
 ): Promise<ModelResponse> {
-=======
-async function runPrompt(prompt: string, maxTokens: number): Promise<string> {
-  const primary = process.env.HF_MODEL?.trim() || DEFAULT_MODEL;
-  const models = primary === FALLBACK_MODEL ? [primary] : [primary, FALLBACK_MODEL];
->>>>>>> 2cd3cbecae98bdd06938813ab28209f983779eaf
 
   let lastError: unknown;
   for (const model of models) {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-<<<<<<< HEAD
         return { content: await callModel(model, prompt, maxTokens), model };
-      } catch (error) {
-        lastError = error;
-        if (!isRetryable(error)) break; // model/auth problem: skip to fallback model
-        // Back off only when another attempt will actually run. The old loop
-        // slept after its final failure before moving to the fallback model.
-        if (attempt < 1) {
-          await new Promise((resolve) => setTimeout(resolve, 1000));
-        }
-=======
-        return await callModel(model, prompt, maxTokens);
       } catch (error) {
         lastError = error;
         console.warn(
           `[aiService] ${model} attempt ${attempt + 1} failed: ${describeError(error)}`
         );
         if (!isRetryable(error)) break; // model/auth problem: skip to fallback model
-        await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
->>>>>>> 2cd3cbecae98bdd06938813ab28209f983779eaf
+        // Back off only when another attempt will actually run. The old loop
+        // slept after its final failure before moving to the fallback model.
+        if (attempt < 1) {
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
       }
     }
   }
@@ -331,7 +267,6 @@ function coerceEnum<T extends string>(
  * chart marker SIZE on the frontend; SENTIMIENTO drives its COLOR.
  */
 const CLASSIFICATION_RUBRIC =
-<<<<<<< HEAD
   'For every news item return:\n' +
   '- "summary": one informative sentence of 25 to 45 words, written ONLY in that item’s ' +
   'TARGET OUTPUT LANGUAGE. Explain the main event and, where supported by the input, include ' +
@@ -386,34 +321,6 @@ function isClearlyWrongLanguage(
   return targetLanguage === 'en'
     ? spanishScore >= minimumWrongLanguageScore && spanishScore >= englishScore + 2
     : englishScore >= minimumWrongLanguageScore && englishScore >= spanishScore + 2;
-=======
-  'Para cada noticia devuelve:\n' +
-  '- "summary": una frase informativa de entre 25 y 45 palabras en el idioma indicado. ' +
-  'Debe explicar el hecho principal y, cuando el texto lo permita, añadir una cifra, contexto ' +
-  'o consecuencia relevante para el inversor. No copies, traduzcas ni reformules simplemente ' +
-  'el titular. No añadas datos que no estén en la noticia y no mezcles idiomas.\n' +
-  '- "localizedTitle": traduccion fiel del titular al idioma indicado. Conserva nombres propios, ' +
-  'tickers, cifras y significado; no añadas informacion. Omite anotaciones de bolsa entre ' +
-  'parentesis como (NYSE:IBM) o (NASDAQ:AMZN).\n' +
-  '- "importancia", segun el impacto potencial en la cotizacion de la empresa:\n' +
-  '  * MUY_IMPORTANTE: resultados trimestrales/anuales, fusiones/adquisiciones/OPA, ' +
-  'profit warning, cambio de guidance, sancion o fallo regulatorio/judicial relevante, ' +
-  'cambio de CEO/CFO, ampliacion de capital, recorte o subida de dividendo, quiebra.\n' +
-  '  * IMPORTANTE: mejora/rebaja de recomendacion o precio objetivo de analistas, ' +
-  'contrato o producto significativo, movimiento brusco de la cotizacion, cambios ' +
-  'estrategicos concretos.\n' +
-  '  * NEUTRO: cobertura general, la empresa aparece junto a otras, analisis sin novedad.\n' +
-  '  * POCO_RELEVANTE: patrocinios, RSC, marca, listas genericas, contenido promocional.\n' +
-  '- "sentimiento": efecto esperado para el accionista: POSITIVO, NEGATIVO o NEUTRO.\n';
-
-function neutralEnrichment(fallbackSummary = ''): NewsEnrichment {
-  return {
-    localizedTitle: '',
-    summary: fallbackSummary,
-    sentiment: 'NEUTRO',
-    importance: 'NEUTRO',
-  };
->>>>>>> 2cd3cbecae98bdd06938813ab28209f983779eaf
 }
 
 function parseEnrichment(
@@ -439,19 +346,16 @@ function parseEnrichment(
 // How many news items to classify per LLM call. Keeps calls per request low
 // (40 items = 5 calls) without the response growing past max_tokens.
 const BATCH_SIZE = 8;
-<<<<<<< HEAD
 // Long chart ranges can contain several batches. Run a few concurrently so a
 // 30/40-item request does not pay the model latency four or five times in
 // sequence, while keeping provider pressure bounded.
 const BATCH_CONCURRENCY = 3;
-=======
 
 // Token budget per item in a batch. A localized title plus a 25-45 word summary
 // in Spanish runs longer than in English; too small a budget truncates the JSON
 // array mid-answer, which used to discard the whole batch (no translated titles,
 // no classification) rather than just the tail.
 const MAX_TOKENS_PER_ITEM = 230;
->>>>>>> 2cd3cbecae98bdd06938813ab28209f983779eaf
 
 /**
  * Classify a batch of news items (summary + importance + sentiment) using ONE
@@ -464,7 +368,6 @@ export async function enrichNewsBatch(
   items: EnrichmentInput[]
 ): Promise<Array<NewsEnrichment | null>> {
   const results: Array<NewsEnrichment | null> = [];
-<<<<<<< HEAD
   const chunks: EnrichmentInput[][] = [];
 
   for (let offset = 0; offset < items.length; offset += BATCH_SIZE) {
@@ -554,7 +457,7 @@ async function enrichChunk(chunk: EnrichmentInput[]): Promise<Array<NewsEnrichme
         'News items:\n' +
         numbered +
         '\n\nFINAL LANGUAGE CHECK: localizedTitle and summary must use each item’s TARGET OUTPUT LANGUAGE.';
-    const maxTokens = 160 * chunk.length;
+    const maxTokens = MAX_TOKENS_PER_ITEM * chunk.length;
     const response = await runPrompt(prompt, maxTokens);
     const primaryResults = parseChunkResponse(response.content, chunk);
 
@@ -579,45 +482,6 @@ async function enrichChunk(chunk: EnrichmentInput[]): Promise<Array<NewsEnrichme
     }
     console.warn('[aiService] enrichChunk: response contained no JSON array');
   } catch (error) {
-    console.warn('[aiService] enrichChunk failed:', error);
-  }
-
-  // Signal failure so callers skip caching/persisting and retry later.
-  return chunk.map(() => null);
-}
-
-=======
-
-  for (let offset = 0; offset < items.length; offset += BATCH_SIZE) {
-    const chunk = items.slice(offset, offset + BATCH_SIZE);
-    results.push(...(await enrichChunk(chunk)));
-  }
-
-  return results;
-}
-
-async function enrichChunk(chunk: EnrichmentInput[]): Promise<Array<NewsEnrichment | null>> {
-  const numbered = chunk
-    .map((item, i) => {
-      const language = item.targetLanguage === 'es' ? 'español' : 'inglés';
-      return `${i + 1}. [idioma: ${language}] ${item.text.replace(/\s+/g, ' ').slice(0, 600)}`;
-    })
-    .join('\n');
-
-  let raw: string;
-  try {
-    raw = await runPrompt(
-      'Analiza estas noticias financieras.\n' +
-        CLASSIFICATION_RUBRIC +
-        'Devuelve SOLO un array JSON con un objeto por noticia, en el MISMO orden, ' +
-        'con esta forma exacta:\n' +
-        '[{"id": 1, "localizedTitle": "...", "summary": "...", ' +
-        '"importancia": "...", "sentimiento": "..."}, ...]\n\n' +
-        'Noticias:\n' +
-        numbered,
-      MAX_TOKENS_PER_ITEM * chunk.length
-    );
-  } catch (error) {
     // Transport/auth/model failure: every attempt and both models are already
     // exhausted, and splitting the batch would only repeat it. Signal failure so
     // callers skip caching and a later request retries.
@@ -626,19 +490,6 @@ async function enrichChunk(chunk: EnrichmentInput[]): Promise<Array<NewsEnrichme
         describeError(error)
     );
     return chunk.map(() => null);
-  }
-
-  const parsed = parseEnrichmentArray(raw);
-  if (parsed) {
-    return chunk.map((item, i) => {
-      // Prefer matching by the echoed id; fall back to position. A missing
-      // entry means the model answered but skipped this item — treat its
-      // classification as genuinely neutral rather than failed.
-      const entry = parsed.find((p) => p.id === i + 1) ?? parsed[i];
-      return entry
-        ? parseEnrichment(entry, item.fallbackSummary ?? '')
-        : neutralEnrichment(item.fallbackSummary);
-    });
   }
 
   // The model answered, but the JSON was unusable — typically truncated at
@@ -661,39 +512,6 @@ async function enrichChunk(chunk: EnrichmentInput[]): Promise<Array<NewsEnrichme
   return chunk.map(() => null);
 }
 
-type RawEnrichmentEntry = {
-  id?: number;
-  summary?: string;
-  localizedTitle?: string;
-  importancia?: string;
-  sentimiento?: string;
-  // Tolerate English keys in case the model ignores the schema.
-  importance?: string;
-  sentiment?: string;
-};
-
-/**
- * The JSON array out of a model answer, or null when it isn't usable. An empty
- * array counts as unusable: caching a NEUTRO with no translated title for every
- * item in the batch is worse than retrying.
- */
-function parseEnrichmentArray(raw: string): RawEnrichmentEntry[] | null {
-  const match = raw.match(/\[[\s\S]*\]/);
-  if (!match) {
-    return null;
-  }
-
-  try {
-    const parsed: unknown = JSON.parse(match[0]);
-    return Array.isArray(parsed) && parsed.length > 0
-      ? (parsed as RawEnrichmentEntry[])
-      : null;
-  } catch {
-    return null;
-  }
-}
-
->>>>>>> 2cd3cbecae98bdd06938813ab28209f983779eaf
 /**
  * Summarize, classify market IMPORTANCE, and classify SENTIMENT for a single
  * news item (one LLM call). Returns null when enrichment failed.
