@@ -38,6 +38,27 @@ app.set("trust proxy", TRUST_PROXY_HOPS);
 // Never advertise Express (also stripped per-response in securityHeaders).
 app.disable("x-powered-by");
 
+/**
+ * Accept requests with or without the `/api` prefix.
+ *
+ * The frontend always calls `/api/...`. In development the Angular dev-server
+ * proxy rewrites that away, so this app sees `/news/...`. Firebase Hosting
+ * rewrites do NOT strip anything — the function receives the original
+ * `/api/news/...` — so without this every production call would 404 against
+ * routers mounted at `/news`, `/market`, and so on.
+ *
+ * Normalising here (rather than re-mounting every router under both prefixes)
+ * keeps one set of routes and one place where the difference is explained.
+ */
+app.use((req, _res, nextHandler) => {
+  if (req.url === "/api") {
+    req.url = "/";
+  } else if (req.url.startsWith("/api/")) {
+    req.url = req.url.slice("/api".length);
+  }
+  nextHandler();
+});
+
 app.use(securityHeaders);
 app.use(cors(corsOptions));
 // Every endpoint takes a small JSON object; the default 100kb ceiling is 3

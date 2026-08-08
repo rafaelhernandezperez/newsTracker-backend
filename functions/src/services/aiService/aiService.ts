@@ -32,10 +32,17 @@ type HuggingFaceChatResponse = {
   }>;
 };
 
+/**
+ * One accepted name per credential, deliberately. Accepting an alias as well
+ * (this previously also read HUGGINGFACE_API_KEY) means a rotation has to find
+ * and replace the secret in two places, and a stale value left in the other can
+ * keep working unnoticed. HF_TOKEN is the name declared as a Firebase secret in
+ * config/secrets.ts, so it is the single source of truth.
+ */
 function getHuggingFaceToken(): string {
-  const token = process.env.HF_TOKEN?.trim() || process.env.HUGGINGFACE_API_KEY?.trim();
+  const token = process.env.HF_TOKEN?.trim();
   if (!token) {
-    throw new Error('Missing HF_TOKEN or HUGGINGFACE_API_KEY environment variable');
+    throw new Error('Missing HF_TOKEN environment variable');
   }
 
   return token;

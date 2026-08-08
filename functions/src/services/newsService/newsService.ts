@@ -449,7 +449,9 @@ async function fetchFinnhubNews(
   profile: CompanyProfile,
   range: ResolvedDateRange
 ): Promise<NewsItem[]> {
-  const token = process.env.FINNHUB_TOKEN?.trim() || process.env.FINNHUB_API_KEY?.trim();
+  // Single accepted name, so a rotation has exactly one place to change and no
+  // stale alias can silently keep working. Absent token = feature off.
+  const token = process.env.FINNHUB_TOKEN?.trim();
   if (!token) {
     return [];
   }
