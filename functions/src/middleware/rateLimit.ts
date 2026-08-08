@@ -54,14 +54,33 @@ function identify(req: Request): string {
 export function rateLimit(options: RateLimitOptions) {
   const { windowMs, max, name } = options;
   const windows = new Map<string, Window>();
+  /** Earliest time a full sweep is allowed to run again. */
+  let nextSweepAt = 0;
+  /** Rate-limit our own logging, so a flood cannot also flood Cloud Logging. */
+  let nextLogAt = 0;
 
-  /** Drop expired windows; bounded work per call so it cannot stall a request. */
-  function sweep(now: number): void {
+  /**
+   * Reclaim expired windows. This is O(number of tracked keys), so it must NOT
+   * run per request: a distributed flood creates a new key every time, and an
+   * unconditional sweep at capacity made each of those requests ~174x more
+   * expensive than a normal one — turning the limiter itself into the cheapest
+   * way to burn our CPU. It is therefore capped at once per window.
+   */
+  function sweepExpired(now: number): void {
     for (const [key, window] of windows) {
       if (window.resetAt <= now) windows.delete(key);
     }
-    // Still oversized after sweeping (i.e. a flood of live keys): evict oldest.
-    while (windows.size > MAX_KEYS) {
+    nextSweepAt = now + windowMs;
+  }
+
+  /**
+   * Make room for one new key. Every window in this limiter has the same TTL,
+   * so Map insertion order is also expiry order: the front entry is always the
+   * oldest and the next to expire. Dropping from the front is therefore O(1)
+   * per eviction and needs no scan.
+   */
+  function evictOldest(): void {
+    while (windows.size >= MAX_KEYS) {
       const oldest = windows.keys().next().value;
       if (oldest === undefined) break;
       windows.delete(oldest);
@@ -78,7 +97,12 @@ export function rateLimit(options: RateLimitOptions) {
 
     let window = windows.get(key);
     if (!window || window.resetAt <= now) {
-      if (windows.size >= MAX_KEYS) sweep(now);
+      // Cheap, unconditional bound first; the full sweep is only an
+      // optimisation to reclaim memory and is throttled to once per window.
+      if (windows.size >= MAX_KEYS) {
+        if (now >= nextSweepAt) sweepExpired(now);
+        evictOldest();
+      }
       window = { count: 0, resetAt: now + windowMs };
       windows.set(key, window);
     }
@@ -93,10 +117,15 @@ export function rateLimit(options: RateLimitOptions) {
 
     if (window.count > max) {
       res.setHeader("Retry-After", String(resetSeconds));
-      // Log the limiter and the KIND of identity, never the identity itself:
-      // uids and IPs are personal data, and logs outlive any rate window.
-      const identityKind = key.includes("|uid:") ? "an authenticated user" : "an IP";
-      console.warn(`[rateLimit] ${name} limit exceeded for ${identityKind}`);
+      // Log at most once every 10s per limiter. Logging every rejection means a
+      // flood also becomes a log-volume (and log-bill) amplifier. Log the KIND
+      // of identity, never the identity: uids and IPs are personal data, and
+      // logs are retained far longer than any rate window.
+      if (now >= nextLogAt) {
+        nextLogAt = now + 10_000;
+        const identityKind = key.includes("|uid:") ? "an authenticated user" : "an IP";
+        console.warn(`[rateLimit] ${name} limit exceeded for ${identityKind}`);
+      }
       return res.status(429).json({
         ok: false,
         message: "Too many requests. Please slow down and try again shortly.",

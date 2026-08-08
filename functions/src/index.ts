@@ -15,11 +15,26 @@ import { hfToken } from "./config/secrets.js";
 
 const app = express();
 
-// Cloud Functions terminates TLS at Google's front end and rewrites
-// X-Forwarded-For, so the last proxy hop is trustworthy. Without this, req.ip
-// is the load balancer for every caller and IP-based rate limiting collapses
-// into one shared bucket.
-app.set("trust proxy", 1);
+/**
+ * How many X-Forwarded-For hops to treat as trusted infrastructure.
+ *
+ * Express resolves `req.ip` to the Nth XFF entry counting from the RIGHT. On
+ * Cloud Functions v2 (Cloud Run) Google's front end APPENDS the real client IP,
+ * so the rightmost entry is the trustworthy one and N = 1 is correct. A client
+ * that sends its own X-Forwarded-For only ever prepends to the list, so a
+ * spoofed value cannot displace the appended one — IP rate-limit buckets stay
+ * honest.
+ *
+ * This is the one piece of rate limiting that depends on platform behaviour, so
+ * it is overridable. If `req.ip` ever shows a Google address rather than real
+ * client addresses, every caller collapses into one bucket: raise this to 2.
+ * Verify once after deploying with:
+ *   gcloud functions logs read api --gen2 --region europe-west1
+ * The cost-critical limits are keyed on uid from a verified Firebase JWT, which
+ * no header can influence, so this setting is not what protects the LLM budget.
+ */
+const TRUST_PROXY_HOPS = Number(process.env.TRUST_PROXY_HOPS) || 1;
+app.set("trust proxy", TRUST_PROXY_HOPS);
 // Never advertise Express (also stripped per-response in securityHeaders).
 app.disable("x-powered-by");
 
