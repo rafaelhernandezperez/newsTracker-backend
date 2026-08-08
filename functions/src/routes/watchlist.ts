@@ -1,5 +1,6 @@
 import { Router, type Request, type Response } from "express";
 import { requireAuth } from "../middleware/auth";
+import { validateCompanyName, validateTicker } from "../middleware/validation";
 import {
   addTickerToWatchlist,
   getUserWatchlist,
@@ -36,15 +37,20 @@ router.post("/", async (req: Request, res: Response) => {
       return res.status(401).json({ ok: false, message: "Unauthorized" });
     }
 
-    const ticker = typeof req.body?.ticker === "string" ? req.body.ticker.trim().toUpperCase() : "";
-    const companyName = typeof req.body?.companyName === "string" ? req.body.companyName.trim() : undefined;
-
-    if (!ticker) {
-      return res.status(400).json({ ok: false, message: "ticker is required" });
+    // The ticker becomes a Firestore document id, so it must be validated as a
+    // single path segment before it reaches the service layer.
+    const ticker = validateTicker(req.body?.ticker);
+    if (!ticker.ok) {
+      return res.status(400).json({ ok: false, message: ticker.message });
     }
 
-    await addTickerToWatchlist(uid, ticker, companyName);
-    return res.status(201).json({ ok: true, ticker, message: "Ticker added" });
+    const companyName = validateCompanyName(req.body?.companyName);
+    if (!companyName.ok) {
+      return res.status(400).json({ ok: false, message: companyName.message });
+    }
+
+    await addTickerToWatchlist(uid, ticker.value, companyName.value);
+    return res.status(201).json({ ok: true, ticker: ticker.value, message: "Ticker added" });
   } catch (error) {
     console.error("[routes/watchlist] POST error:", error);
     return res.status(500).json({ ok: false, message: "Error adding ticker" });
@@ -60,13 +66,13 @@ router.delete("/:ticker", async (req: Request, res: Response) => {
       return res.status(401).json({ ok: false, message: "Unauthorized" });
     }
 
-    const ticker = (req.params.ticker ?? "").trim().toUpperCase();
-    if (!ticker) {
-      return res.status(400).json({ ok: false, message: "ticker is required" });
+    const ticker = validateTicker(req.params.ticker);
+    if (!ticker.ok) {
+      return res.status(400).json({ ok: false, message: ticker.message });
     }
 
-    await removeTickerFromWatchlist(uid, ticker);
-    return res.json({ ok: true, ticker, message: "Ticker removed" });
+    await removeTickerFromWatchlist(uid, ticker.value);
+    return res.json({ ok: true, ticker: ticker.value, message: "Ticker removed" });
   } catch (error) {
     console.error("[routes/watchlist] DELETE error:", error);
     return res.status(500).json({ ok: false, message: "Error removing ticker" });

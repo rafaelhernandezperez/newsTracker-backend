@@ -78,8 +78,12 @@ app.post('/dev/digest', async (_req, res) => {
 app.use(api);
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`[dev-server] listening on http://localhost:${PORT}`);
+// Bind to loopback ONLY. This server exposes unauthenticated /dev/track and
+// /dev/digest triggers; on the default 0.0.0.0 bind, anyone on the same
+// network (office wifi, shared VPN) could run tracking cycles and read the
+// API using this machine's service-account credentials.
+app.listen(PORT, '127.0.0.1', () => {
+  console.log(`[dev-server] listening on http://127.0.0.1:${PORT} (loopback only)`);
   console.log(`[dev-server] credentials: ${hasCreds ? 'loaded' : 'NONE (only /news/:ticker works)'}`);
   console.log(`[dev-server] live news:   GET  http://localhost:${PORT}/news/AAPL?limit=10`);
   console.log(`[dev-server] run tracker: POST http://localhost:${PORT}/dev/track`);

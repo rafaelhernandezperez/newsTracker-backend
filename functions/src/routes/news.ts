@@ -1,9 +1,19 @@
 //GET /news/:ticker
 import { Router, type Request, type Response } from 'express';
+import { requireAuth } from '../middleware/auth';
+import {
+  clampInt,
+  requireValidTicker,
+  validateCompanyName,
+  validateDateInput,
+  validateLanguage,
+} from '../middleware/validation';
 import { fetchNewsForTicker } from '../services/newsService/newsService';
 import { getStoredNews } from '../services/firebaseService/firebaseService';
 
 const router = Router();
+
+router.use(requireAuth);
 
 function getQueryString(value: unknown): string | undefined {
   if (typeof value === 'string') {
@@ -17,95 +27,94 @@ function getQueryString(value: unknown): string | undefined {
   return undefined;
 }
 
+/** Only these windows are accepted; anything else is a client bug, not a range. */
+const ALLOWED_RANGES = new Set(['1D', '5D', '1W', '1M', '3M', '6M', '1Y']);
+
 // GET /news/:ticker/stored - AI-enriched news persisted by the tracker pipeline
-router.get('/:ticker/stored', async (req: Request, res: Response) => {
+router.get('/:ticker/stored', requireValidTicker, async (req: Request, res: Response) => {
   try {
-    const { ticker } = req.params;
-    const rawLimit = getQueryString(req.query.limit);
-    const parsedLimit = rawLimit ? Number(rawLimit) : undefined;
-    const limit =
-      typeof parsedLimit === 'number' && Number.isFinite(parsedLimit) && parsedLimit > 0
-        ? Math.min(Math.floor(parsedLimit), 100)
-        : 30;
+    const ticker = res.locals.ticker as string;
+    const limit = clampInt(getQueryString(req.query.limit), { min: 1, max: 100, fallback: 30 });
 
     const items = await getStoredNews(ticker, limit);
-    return res.json({ ok: true, ticker: ticker.toUpperCase(), count: items.length, items });
+    return res.json({ ok: true, ticker, count: items.length, items });
   } catch (error) {
     console.error('[routes/news] stored error:', error);
     return res.status(500).json({ ok: false, message: 'Error fetching stored news' });
   }
 });
 
-router.get('/:ticker', async (req: Request, res: Response) => {
+router.get('/:ticker', requireValidTicker, async (req: Request, res: Response) => {
   try {
-    const { ticker } = req.params;
-    const companyName = getQueryString(req.query.companyName);
+    const ticker = res.locals.ticker as string;
 
-    const rawLimit = getQueryString(req.query.limit);
-    const parsedLimit = rawLimit ? Number(rawLimit) : undefined;
-    const limit =
-      typeof parsedLimit === 'number' && Number.isFinite(parsedLimit) && parsedLimit > 0
-        ? Math.min(Math.floor(parsedLimit), 100)
-        : 20;
+    const companyName = validateCompanyName(getQueryString(req.query.companyName));
+    if (!companyName.ok) {
+      return res.status(400).json({ ok: false, message: companyName.message });
+    }
 
-    const range =
+    const limit = clampInt(getQueryString(req.query.limit), { min: 1, max: 100, fallback: 20 });
+
+    const rawRange =
       getQueryString(req.query.range) ??
       getQueryString(req.query.period) ??
       getQueryString(req.query.timeframe) ??
       getQueryString(req.query.window);
+    const range = rawRange?.trim().toUpperCase();
+    if (range && !ALLOWED_RANGES.has(range)) {
+      return res.status(400).json({
+        ok: false,
+        message: `range must be one of: ${[...ALLOWED_RANGES].join(', ')}`,
+      });
+    }
 
-    const from = getQueryString(req.query.from);
-    const to = getQueryString(req.query.to);
-    const rawDaysBack = getQueryString(req.query.daysBack);
-    const parsedDaysBack = rawDaysBack ? Number(rawDaysBack) : undefined;
+    const from = validateDateInput(getQueryString(req.query.from));
+    if (!from.ok) return res.status(400).json({ ok: false, message: `from: ${from.message}` });
+    const to = validateDateInput(getQueryString(req.query.to));
+    if (!to.ok) return res.status(400).json({ ok: false, message: `to: ${to.message}` });
+
+    // 0 means "unset" here, and daysBack is separately capped to MAX_LOOKBACK_DAYS
+    // inside the news service.
     const daysBack =
-      typeof parsedDaysBack === 'number' && Number.isFinite(parsedDaysBack) && parsedDaysBack > 0
-        ? parsedDaysBack
-        : undefined;
+      clampInt(getQueryString(req.query.daysBack), { min: 0, max: 365, fallback: 0 }) || undefined;
+
     const rssOnly = getQueryString(req.query.rssOnly)?.toLowerCase() === 'true';
     const enrich = getQueryString(req.query.enrich)?.toLowerCase() !== 'false';
-    const requestedLanguage =
-      getQueryString(req.query.lang) ?? getQueryString(req.query.language) ?? 'en';
-    if (requestedLanguage !== 'en' && requestedLanguage !== 'es') {
-      return res.status(400).json({
-        ok: false,
-        message: 'Language must be "en" or "es"',
-      });
+
+    const language = validateLanguage(
+      getQueryString(req.query.lang) ?? getQueryString(req.query.language),
+      'en'
+    );
+    if (!language.ok) {
+      return res.status(400).json({ ok: false, message: language.message });
     }
-    const requestedSourceLanguage = getQueryString(req.query.sourceLanguage);
-    if (
-      requestedSourceLanguage &&
-      requestedSourceLanguage !== 'en' &&
-      requestedSourceLanguage !== 'es'
-    ) {
-      return res.status(400).json({
-        ok: false,
-        message: 'Source language must be "en" or "es"',
-      });
+
+    const rawSourceLanguage = getQueryString(req.query.sourceLanguage);
+    const sourceLanguage = validateLanguage(rawSourceLanguage, 'en');
+    if (!sourceLanguage.ok) {
+      return res.status(400).json({ ok: false, message: `source ${sourceLanguage.message}` });
     }
-    const sourceLanguage: 'en' | 'es' | undefined =
-      requestedSourceLanguage === 'en' || requestedSourceLanguage === 'es'
-        ? requestedSourceLanguage
-        : undefined;
 
     const news = await fetchNewsForTicker(ticker, {
-      companyName,
+      companyName: companyName.value,
       limit,
       range,
-      from,
-      to,
+      from: from.value,
+      to: to.value,
       daysBack,
       rssOnly,
       // Attach AI importance + sentiment so the frontend chart can size/color
       // its news markers. Cached per item, so repeat requests stay cheap.
       enrich,
-      language: requestedLanguage,
-      sourceLanguage,
+      language: language.value,
+      // Absent sourceLanguage means "no source-language filter", which is not
+      // the same as defaulting it to English.
+      sourceLanguage: rawSourceLanguage ? sourceLanguage.value : undefined,
     });
 
     return res.json({
       ok: true,
-      ticker: ticker.toUpperCase(),
+      ticker,
       count: news.length,
       items: news,
     });

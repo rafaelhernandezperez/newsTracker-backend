@@ -1,17 +1,17 @@
 import { Router, type Request, type Response } from 'express';
+import { requireAuth } from '../middleware/auth';
+import { clampInt, requireValidTicker } from '../middleware/validation';
 import { getQuote, getHistory } from '../services/marketService/marketService.js';
 
 const router = Router();
 
-router.get('/:ticker', async (req: Request, res: Response) => {
+router.use(requireAuth);
+
+router.get('/:ticker', requireValidTicker, async (req: Request, res: Response) => {
   try {
-    const { ticker } = req.params;
-    const requestedDays = Number(req.query.days);
+    const ticker = res.locals.ticker as string;
     // Cap at ~10 years so absurd values can't produce runaway date math.
-    const days =
-      Number.isFinite(requestedDays) && requestedDays > 0
-        ? Math.min(Math.floor(requestedDays), 3650)
-        : 30;
+    const days = clampInt(req.query.days, { min: 1, max: 3650, fallback: 30 });
 
     const [quote, history] = await Promise.all([
       getQuote(ticker),
@@ -27,7 +27,7 @@ router.get('/:ticker', async (req: Request, res: Response) => {
 
     return res.json({
       ok: true,
-      ticker: ticker.toUpperCase(),
+      ticker,
       range: { days, points: history.length },
       quote,
       chart,

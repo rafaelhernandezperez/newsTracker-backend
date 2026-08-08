@@ -10,15 +10,53 @@ service cloud.firestore {
       return isSignedIn() && request.auth.uid == userId;
     }
 
+    // The three booleans the app writes, and nothing else. Rules are the only
+    // check on direct SDK writes (the API's validation is bypassed entirely
+    // when a client talks to Firestore straight from the browser).
+    function validAlertPrefs(prefs) {
+      return prefs.keys().hasOnly(['priceMoves', 'highImpact', 'dailyDigest'])
+        && (!('priceMoves' in prefs) || prefs.priceMoves is bool)
+        && (!('highImpact' in prefs) || prefs.highImpact is bool)
+        && (!('dailyDigest' in prefs) || prefs.dailyDigest is bool);
+    }
+
     match /users/{userId} {
-      allow read, create, update, delete: if isOwner(userId);
+      allow read, delete: if isOwner(userId);
+      // Cap the document and validate alertPrefs so a signed-in user cannot
+      // turn their own profile into unbounded storage or write junk that the
+      // scheduler will later read back.
+      allow create, update: if isOwner(userId)
+        && request.resource.data.keys().size() <= 12
+        && (!('alertPrefs' in request.resource.data)
+            || validAlertPrefs(request.resource.data.alertPrefs));
 
       match /watchlist/{ticker} {
-        allow read, create, update, delete: if isOwner(userId);
+        allow read, delete: if isOwner(userId);
+        allow create, update: if isOwner(userId)
+          && ticker.size() <= 15
+          && ticker.matches('^[A-Z0-9][A-Z0-9.=^-]*$')
+          && request.resource.data.keys()
+               .hasOnly(['ticker', 'companyName', 'notificationsEnabled', 'createdAt'])
+          && request.resource.data.ticker == ticker
+          && (!('companyName' in request.resource.data)
+              || request.resource.data.companyName == null
+              || (request.resource.data.companyName is string
+                  && request.resource.data.companyName.size() <= 120))
+          && (!('notificationsEnabled' in request.resource.data)
+              || request.resource.data.notificationsEnabled is bool);
       }
 
       match /devices/{token} {
-        allow read, create, update, delete: if isOwner(userId);
+        allow read, delete: if isOwner(userId);
+        // Device registration goes through the API (which validates the token
+        // shape and platform); these bounds stop a direct SDK write from
+        // planting arbitrary documents that the FCM fan-out would then read.
+        allow create, update: if isOwner(userId)
+          && token.size() >= 64 && token.size() <= 4096
+          && request.resource.data.keys().hasOnly(['token', 'platform', 'updatedAt'])
+          && request.resource.data.token == token
+          && (!('platform' in request.resource.data)
+              || request.resource.data.platform in ['web', 'android', 'ios', 'unknown']);
       }
     }
 
@@ -27,6 +65,18 @@ service cloud.firestore {
     match /news/{newsId} {
       allow read: if isSignedIn();
       allow write: if false;
+    }
+
+    // Backend-only dedup ledger for the once-a-day price alert. It was covered
+    // by the default deny, but stating it keeps the intent explicit.
+    match /priceAlerts/{alertId} {
+      allow read, write: if false;
+    }
+
+    // Anything not matched above is denied. Spelled out so a future collection
+    // is never silently world-readable because a rule was forgotten.
+    match /{document=**} {
+      allow read, write: if false;
     }
   }
 }

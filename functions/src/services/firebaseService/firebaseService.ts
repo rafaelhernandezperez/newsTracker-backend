@@ -1,4 +1,5 @@
 import admin from "firebase-admin";
+import { isSafeDocumentId } from "../../middleware/validation";
 
 if (!admin.apps.length) {
   admin.initializeApp();
@@ -7,19 +8,40 @@ if (!admin.apps.length) {
 export const db = admin.firestore();
 export const auth = admin.auth();
 
+/**
+ * Assert that a value is safe to use as a Firestore document id.
+ *
+ * `db.collection(c).doc(value)` treats "/" as a path separator, so an id like
+ * `A/B/C` silently writes to a different depth of the tree than the call site
+ * suggests. Routes already validate their inputs; this is the backstop for
+ * every other caller — the scheduler, the digest, and any future code path —
+ * because the Admin SDK bypasses Firestore security rules entirely, making this
+ * layer the last place a malformed id can be caught.
+ *
+ * Throwing (rather than sanitising) is deliberate: a bad id here means a bug or
+ * an attack upstream, and quietly rewriting it would hide both.
+ */
+function assertDocumentId(value: string, label: string): string {
+  if (!isSafeDocumentId(value)) {
+    throw new Error(`[firebaseService] unsafe ${label} document id rejected`);
+  }
+  return value;
+}
+
 export async function addTickerToWatchlist(
   uid: string,
   ticker: string,
   companyName?: string
 ): Promise<void> {
+  const docId = assertDocumentId(ticker.toUpperCase(), "ticker");
   await db
     .collection("users")
-    .doc(uid)
+    .doc(assertDocumentId(uid, "uid"))
     .collection("watchlist")
-    .doc(ticker.toUpperCase())
+    .doc(docId)
     .set(
       {
-        ticker: ticker.toUpperCase(),
+        ticker: docId,
         companyName: companyName ?? null,
         notificationsEnabled: true,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -41,9 +63,9 @@ export async function getUserWatchlist(uid: string): Promise<FirebaseFirestore.D
 export async function removeTickerFromWatchlist(uid: string, ticker: string): Promise<void> {
   await db
     .collection("users")
-    .doc(uid)
+    .doc(assertDocumentId(uid, "uid"))
     .collection("watchlist")
-    .doc(ticker.toUpperCase())
+    .doc(assertDocumentId(ticker.toUpperCase(), "ticker"))
     .delete();
 }
 
@@ -59,9 +81,9 @@ export async function registerDeviceToken(
   // Doc id = token so re-registering the same device is idempotent.
   await db
     .collection("users")
-    .doc(uid)
+    .doc(assertDocumentId(uid, "uid"))
     .collection("devices")
-    .doc(token)
+    .doc(assertDocumentId(token, "device token"))
     .set(
       {
         token,
@@ -73,7 +95,12 @@ export async function registerDeviceToken(
 }
 
 export async function removeDeviceToken(uid: string, token: string): Promise<void> {
-  await db.collection("users").doc(uid).collection("devices").doc(token).delete();
+  await db
+    .collection("users")
+    .doc(assertDocumentId(uid, "uid"))
+    .collection("devices")
+    .doc(assertDocumentId(token, "device token"))
+    .delete();
 }
 
 export async function getDeviceTokensForUsers(uids: string[]): Promise<string[]> {
@@ -170,8 +197,9 @@ export async function getAlertPrefsForUsers(uids: string[]): Promise<Map<string,
  */
 export async function claimPriceAlert(ticker: string, dateKey: string): Promise<boolean> {
   try {
-    await db.collection("priceAlerts").doc(`${ticker.toUpperCase()}_${dateKey}`).create({
-      ticker: ticker.toUpperCase(),
+    const symbol = assertDocumentId(ticker.toUpperCase(), "ticker");
+    await db.collection("priceAlerts").doc(`${symbol}_${dateKey}`).create({
+      ticker: symbol,
       date: dateKey,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
@@ -338,7 +366,7 @@ export async function saveNewsItem(item: StoredNews): Promise<void> {
     // orders the /stored feed) or re-write the enrichment.
     await db
       .collection("news")
-      .doc(id)
+      .doc(assertDocumentId(id, "news"))
       .create({
         ...rest,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),

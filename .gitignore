@@ -1,8 +1,22 @@
-serviceAccountKey.json
+# Secrets — never commit. Patterns are deliberately broad: a file that merely
+# looks like a credential should be ignored by default, not by remembering to
+# add it. (HF_TOKEN was committed in the initial commit and had to be rotated.)
 .env
+.env.*
+!.env.example
+*serviceAccount*.json
+*serviceAccountKey*.json
+*-credentials.json
+*.pem
+*.p8
+*.p12
+
 functions/node_modules
+node_modules
 .DS_Store
-functions/serviceAccount.json
+
+# Local AI evaluation dumps — contain full prompts and model output.
+ai-evaluation.log
 
 # Thesis drafts and internal docs — local only, never pushed
 docs/
