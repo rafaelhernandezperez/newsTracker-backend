@@ -4,6 +4,8 @@ import { getDeviceTokensForUsers, pruneInvalidTokens } from "../firebaseService/
 export type NewsNotification = {
   ticker: string;
   title: string;
+  /** Optional short, presentation-ready title; used by polished showcase pushes. */
+  displayTitle?: string;
   body: string;
   link: string;
   newsId: string;
@@ -28,19 +30,24 @@ export async function notifySubscribers(
     return { sent: 0, failed: 0 };
   }
 
+  // Keep web pushes data-only. Notification payloads are auto-rendered by the
+  // Firebase SDK and would then also reach our service worker's explicit
+  // showNotification() handler, producing two browser notifications. Let the
+  // worker render exactly one and own the validated click target.
   const payload = {
-    notification: {
-      title: `${notification.ticker}: ${notification.title}`.slice(0, 240),
-      body: notification.body.slice(0, 480),
-    },
     data: {
       ticker: notification.ticker,
+      title: (
+        notification.displayTitle ?? `${notification.ticker}: ${notification.title}`
+      ).slice(0, 240),
+      body: notification.body.slice(0, 480),
       newsId: notification.newsId,
       link: notification.link,
       sentiment: notification.sentiment ?? "NEUTRO",
     },
     android: { priority: "high" as const },
-    apns: { payload: { aps: { sound: "default" } } },
+    apns: { payload: { aps: { contentAvailable: true, sound: "default" } } },
+    webpush: { headers: { Urgency: "high" } },
   };
 
   // sendEachForMulticast accepts at most 500 tokens per call.

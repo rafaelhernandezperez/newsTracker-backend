@@ -78,29 +78,77 @@ export async function registerDeviceToken(
   token: string,
   platform?: string
 ): Promise<void> {
-  // Doc id = token so re-registering the same device is idempotent.
-  await db
+  const safeUid = assertDocumentId(uid, "uid");
+  const safeToken = assertDocumentId(token, "device token");
+  const ownerRef = db.collection("deviceTokenOwners").doc(safeToken);
+  const currentRef = db
     .collection("users")
-    .doc(assertDocumentId(uid, "uid"))
+    .doc(safeUid)
     .collection("devices")
-    .doc(assertDocumentId(token, "device token"))
-    .set(
+    .doc(safeToken);
+
+  // An FCM token identifies one browser/app installation, not one account.
+  // Reassign it when a shared browser changes accounts so the previous user
+  // cannot keep receiving alerts on this device. The frontend also unregisters
+  // on logout; this server-side cleanup covers crashes and missed logouts.
+  //
+  // Keep a direct owner record instead of querying collectionGroup("devices"):
+  // that query needs a separately deployed collection-group index, and a
+  // missing index made every first-time browser registration fail with HTTP
+  // 500. The transaction also closes the account-switch race.
+  await db.runTransaction(async (transaction) => {
+    const owner = await transaction.get(ownerRef);
+    const previousUid = owner.get("uid");
+
+    if (
+      typeof previousUid === "string" &&
+      isSafeDocumentId(previousUid) &&
+      previousUid !== safeUid
+    ) {
+      transaction.delete(
+        db
+          .collection("users")
+          .doc(previousUid)
+          .collection("devices")
+          .doc(safeToken)
+      );
+    } else if (previousUid !== undefined && previousUid !== safeUid) {
+      // A corrupt owner record must not permanently block a legitimate browser
+      // from registering. Overwriting it below self-heals the canonical owner.
+      console.warn("[firebaseService] ignoring malformed device owner uid");
+    }
+
+    const updatedAt = admin.firestore.FieldValue.serverTimestamp();
+    transaction.set(
+      currentRef,
       {
-        token,
+        token: safeToken,
         platform: platform ?? "unknown",
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt,
       },
       { merge: true }
     );
+    transaction.set(ownerRef, { uid: safeUid, updatedAt });
+  });
 }
 
 export async function removeDeviceToken(uid: string, token: string): Promise<void> {
-  await db
+  const safeUid = assertDocumentId(uid, "uid");
+  const safeToken = assertDocumentId(token, "device token");
+  const deviceRef = db
     .collection("users")
-    .doc(assertDocumentId(uid, "uid"))
+    .doc(safeUid)
     .collection("devices")
-    .doc(assertDocumentId(token, "device token"))
-    .delete();
+    .doc(safeToken);
+  const ownerRef = db.collection("deviceTokenOwners").doc(safeToken);
+
+  await db.runTransaction(async (transaction) => {
+    const owner = await transaction.get(ownerRef);
+    transaction.delete(deviceRef);
+    if (owner.get("uid") === safeUid) {
+      transaction.delete(ownerRef);
+    }
+  });
 }
 
 export async function getDeviceTokensForUsers(uids: string[]): Promise<string[]> {
@@ -117,18 +165,25 @@ export async function getDeviceTokensForUsers(uids: string[]): Promise<string[]>
 /** Remove tokens that FCM reported as invalid/unregistered, across all users. */
 export async function pruneInvalidTokens(tokens: string[]): Promise<void> {
   if (tokens.length === 0) return;
-  const snaps = await Promise.all(
-    tokens.map((token) =>
-      db.collectionGroup("devices").where("token", "==", token).get()
-    )
+  await Promise.all(
+    Array.from(new Set(tokens)).map(async (token) => {
+      if (!isSafeDocumentId(token)) {
+        console.warn("[firebaseService] refusing to prune malformed device token");
+        return;
+      }
+      const ownerRef = db.collection("deviceTokenOwners").doc(token);
+      await db.runTransaction(async (transaction) => {
+        const owner = await transaction.get(ownerRef);
+        const ownerUid = owner.get("uid");
+        if (typeof ownerUid === "string" && isSafeDocumentId(ownerUid)) {
+          transaction.delete(
+            db.collection("users").doc(ownerUid).collection("devices").doc(token)
+          );
+        }
+        transaction.delete(ownerRef);
+      });
+    })
   );
-  // Firestore batches are limited to 500 operations.
-  const docs = snaps.flatMap((snap) => snap.docs);
-  for (let i = 0; i < docs.length; i += 500) {
-    const batch = db.batch();
-    docs.slice(i, i + 500).forEach((doc) => batch.delete(doc.ref));
-    await batch.commit();
-  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -332,6 +387,15 @@ export type StoredNews = {
   score: number;
 };
 
+export type StoredNewsRecord = StoredNews & {
+  createdAt?: FirebaseFirestore.Timestamp;
+};
+
+export type PushTestNews = {
+  story: StoredNewsRecord;
+  companyName?: string;
+};
+
 /** Return the subset of ids that are NOT already stored (i.e. genuinely new). */
 export async function filterNewNewsIds(ids: string[]): Promise<Set<string>> {
   if (ids.length === 0) return new Set();
@@ -356,6 +420,104 @@ export async function getStoredNews(
     .limit(limit)
     .get();
   return snap.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+}
+
+const PUSH_IMPORTANCE_RANK: Record<string, number> = {
+  MUY_IMPORTANTE: 4,
+  IMPORTANTE: 3,
+  NEUTRO: 2,
+  POCO_RELEVANTE: 1,
+};
+
+const COMPANY_SUFFIXES =
+  /\b(?:inc|incorporated|corp|corporation|co|company|ltd|limited|plc|sa|s\.a\.|ag|nv|n\.v\.|holdings?|group|the)\b/gi;
+
+function normalizeCompanyText(value: string): string {
+  return value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Reject a cached ticker assignment when the source never names that company. */
+function directlyNamesCompany(story: StoredNewsRecord, companyName?: string): boolean {
+  if (!companyName) return true;
+
+  const text = normalizeCompanyText(`${story.title} ${story.summary ?? ""}`);
+  const cleanName = normalizeCompanyText(companyName.replace(COMPANY_SUFFIXES, " "));
+  if (cleanName.length >= 4 && text.includes(cleanName)) return true;
+
+  // This catches headlines that use a shortened trading name ("Apple" rather
+  // than "Apple Inc.", "Disney" rather than "The Walt Disney Company").
+  const textWords = new Set(text.split(" "));
+  return cleanName
+    .split(" ")
+    .some((namePart) => namePart.length >= 5 && textWords.has(namePart));
+}
+
+function pushStoryQuality(story: StoredNewsRecord, recencyIndex: number): number {
+  const rawSummaryLength = String(story.summary ?? "").trim().length;
+  const importance = PUSH_IMPORTANCE_RANK[String(story.importance ?? "")] ?? 0;
+  const relevance = Number.isFinite(story.score) ? story.score : 0;
+
+  // Importance and source substance dominate. Recency only breaks close ties;
+  // the newest row is not automatically the strongest notification demo.
+  return importance * 10_000 + Math.min(rawSummaryLength, 2_000) + relevance * 10 - recencyIndex;
+}
+
+/**
+ * Pick a showcase-quality real story for the authenticated user's push test.
+ * A candidate must contain a substantive source snippet, because terse legacy
+ * AI summaries cannot support a credible investor takeaway. Stories from the
+ * user's watchlist are preferred and must directly name the watched company,
+ * which prevents a weak ticker match from becoming a misleading notification.
+ *
+ * One bounded recent window avoids a composite-index dependency. Within that
+ * window we rank impact, source substance, relevance and recency locally.
+ */
+export async function getPushTestNews(uid: string): Promise<PushTestNews | null> {
+  const watchlist = await getUserWatchlist(assertDocumentId(uid, "uid"));
+  const watchedCompanies = new Map(
+    watchlist
+      .filter((item) => item.notificationsEnabled !== false)
+      .map((item) => [
+        String(item.ticker ?? "").trim().toUpperCase(),
+        String(item.companyName ?? "").trim() || undefined,
+      ] as const)
+      .filter(([ticker]) => isSafeDocumentId(ticker))
+  );
+
+  const recent = await db.collection("news").orderBy("createdAt", "desc").limit(250).get();
+  const stories = recent.docs.map(
+    (doc) => ({ id: doc.id, ...doc.data() }) as StoredNewsRecord
+  );
+  if (stories.length === 0) return null;
+
+  const candidates = stories
+    .map((story, recencyIndex) => {
+      const ticker = String(story.ticker ?? "").trim().toUpperCase();
+      const watched = watchedCompanies.has(ticker);
+      const companyName = watchedCompanies.get(ticker);
+      const hasSourceMaterial = String(story.summary ?? "").trim().length >= 120;
+      const validWatchedMatch = !watched || directlyNamesCompany(story, companyName);
+      return {
+        story,
+        companyName,
+        watched,
+        eligible: hasSourceMaterial && validWatchedMatch,
+        quality: pushStoryQuality(story, recencyIndex),
+      };
+    })
+    .filter((candidate) => candidate.eligible);
+
+  const pool = candidates.some((candidate) => candidate.watched)
+    ? candidates.filter((candidate) => candidate.watched)
+    : candidates;
+  const selected = pool.sort((a, b) => b.quality - a.quality)[0];
+  return selected ? { story: selected.story, companyName: selected.companyName } : null;
 }
 
 export async function saveNewsItem(item: StoredNews): Promise<void> {

@@ -258,6 +258,21 @@ export type EnrichmentInput = {
   fallbackSummary?: string;
 };
 
+export type PushNotificationCopyInput = {
+  ticker: string;
+  companyName?: string;
+  title: string;
+  /** Unmodified source snippet. This is the factual basis for the push. */
+  summary: string;
+  source?: string;
+  targetLanguage?: 'en' | 'es';
+};
+
+export type PushNotificationCopy = {
+  title: string;
+  body: string;
+};
+
 /** Canonicalize separators and accents in a classification returned by an LLM. */
 function normalizeClassificationLabel(raw: string | undefined): string {
   return (raw ?? '')
@@ -343,6 +358,111 @@ function isClearlyWrongLanguage(
   return targetLanguage === 'en'
     ? spanishScore >= minimumWrongLanguageScore && spanishScore >= englishScore + 2
     : englishScore >= minimumWrongLanguageScore && englishScore >= spanishScore + 2;
+}
+
+const PUSH_BODY_MIN_WORDS = 18;
+const PUSH_BODY_MAX_WORDS = 30;
+const PUSH_BODY_MAX_LENGTH = 190;
+const PUSH_TITLE_MAX_LENGTH = 58;
+
+function compactCompanyName(companyName: string | undefined, ticker: string): string {
+  const cleanTicker = ticker.trim().toUpperCase();
+  const cleanName = (companyName ?? '')
+    .replace(
+      /\b(?:inc|incorporated|corp|corporation|co|company|ltd|limited|plc|sa|s\.a\.|ag|nv|n\.v\.|holdings?|group)\b/gi,
+      ' ',
+    )
+    .replace(/[.,]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!cleanName) return cleanTicker;
+  const suffix = ` (${cleanTicker})`;
+  if (`${cleanName}${suffix}`.length <= PUSH_TITLE_MAX_LENGTH) {
+    return `${cleanName}${suffix}`;
+  }
+
+  const available = PUSH_TITLE_MAX_LENGTH - suffix.length - 1;
+  const clipped = cleanName.slice(0, available);
+  const wordBoundary = clipped.lastIndexOf(' ');
+  const label = (wordBoundary >= 12 ? clipped.slice(0, wordBoundary) : clipped).trimEnd();
+  return `${label}…${suffix}`;
+}
+
+function normalizedPushText(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function numericClaimsAreGrounded(copy: string, source: string): boolean {
+  // Spanish normally renders decimal commas (18,5) while an English source
+  // uses decimal points (18.5). Treat those as the same factual number.
+  const canonicalNumber = (value: string) => value.replace(/,/g, '.');
+  const sourceNumbers = new Set(
+    (source.match(/\d+(?:[.,]\d+)*/g) ?? []).map(canonicalNumber),
+  );
+  const copyNumbers = (copy.match(/\d+(?:[.,]\d+)*/g) ?? []).map(canonicalNumber);
+  return copyNumbers.every((number) => sourceNumbers.has(number));
+}
+
+/**
+ * Turn one substantive real article snippet into display-ready notification
+ * copy. This is intentionally separate from the stored, general-purpose news
+ * summary: notification space is tighter, and a demo must never surface stale
+ * five-word legacy summaries or mix languages.
+ */
+export async function generatePushNotificationCopy(
+  input: PushNotificationCopyInput,
+): Promise<PushNotificationCopy | null> {
+  const targetLanguage = input.targetLanguage === 'es' ? 'es' : 'en';
+  const languageName = targetLanguage === 'es' ? 'SPANISH' : 'ENGLISH';
+  const sourceText = sanitizeSourceText(
+    `Company: ${input.companyName || input.ticker}. Ticker: ${input.ticker}. ` +
+      `Headline: ${input.title}. Source: ${input.source ?? 'Unknown'}. ` +
+      `Article facts: ${input.summary}`,
+  );
+
+  const prompt =
+    `Write premium mobile push copy for an investor news product in ${languageName}.\n` +
+    'Return ONLY JSON with this exact shape: {"body":"..."}.\n' +
+    `The body must be one clear sentence of ${PUSH_BODY_MIN_WORDS}-${PUSH_BODY_MAX_WORDS} words ` +
+    `and no more than ${PUSH_BODY_MAX_LENGTH} characters. Lead with what happened, name the ` +
+    'actor precisely, and include the strongest concrete figure or investor consequence only ' +
+    'when it is explicitly supported by the source. Clearly distinguish allegations, employees, ' +
+    'executives and the company itself. Use an active, confident newsroom tone without hype. ' +
+    'Never say test, preview, demo, sample, notification, buy, sell, or click. Do not add facts, ' +
+    'advice, labels, emojis, a source attribution, or a second sentence.\n' +
+    `[SOURCE TEXT: ${sourceText}]\n` +
+    `FINAL CHECK: the body must be only in ${languageName} and every number must occur in the source.`;
+
+  try {
+    const response = await runPrompt(prompt, 180);
+    const match = response.content.match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    const parsed = JSON.parse(match[0]) as { body?: unknown };
+    if (typeof parsed.body !== 'string') return null;
+
+    const body = normalizedPushText(parsed.body);
+    const wordCount = body.match(/[\p{L}\p{N}$€£%]+(?:['’.-][\p{L}\p{N}$€£%]+)*/gu)?.length ?? 0;
+    if (
+      !body ||
+      body.length > PUSH_BODY_MAX_LENGTH ||
+      wordCount < PUSH_BODY_MIN_WORDS ||
+      wordCount > PUSH_BODY_MAX_WORDS ||
+      isClearlyWrongLanguage(body, targetLanguage) ||
+      !numericClaimsAreGrounded(body, sourceText)
+    ) {
+      console.warn('[aiService] rejected low-quality or ungrounded push copy');
+      return null;
+    }
+
+    return {
+      title: compactCompanyName(input.companyName, input.ticker),
+      body,
+    };
+  } catch (error) {
+    console.warn(`[aiService] push copy generation failed: ${describeError(error)}`);
+    return null;
+  }
 }
 
 function parseEnrichment(
@@ -537,4 +657,3 @@ async function enrichChunk(chunk: EnrichmentInput[]): Promise<Array<NewsEnrichme
   console.warn('[aiService] enrichChunk: unusable response for a single item');
   return chunk.map(() => null);
 }
-
