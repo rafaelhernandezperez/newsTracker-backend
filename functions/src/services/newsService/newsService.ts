@@ -1,20 +1,16 @@
 import Parser from 'rss-parser';
 import axios from 'axios';
 import YahooFinance from 'yahoo-finance2';
-import {
-  GOOGLE_EDITIONS,
-  googleNewsHistoricalUrl,
-  QUERY_SOURCES,
-} from './sources';
+import { GOOGLE_EDITIONS, googleNewsHistoricalUrl, QUERY_SOURCES } from './sources';
 import { resolveCompanyProfile } from './companyResolver';
 import { calculateRelevanceScore, financialSignal } from './relevance';
-import { stableNewsKey, dedupeNews, normalizeText } from './normalizers';
+import { stableNewsKey, dedupeNews, normalizeText, toTimestamp } from './normalizers';
 import { TtlCache } from './cache';
 import { enrichNewsBatch } from '../aiService/aiService';
 import type { CompanyProfile, NewsItem } from './types';
 
 const parser = new Parser({
-  // One stalled feed should not hold an interactive request for 12 seconds;
+  // One stalled feed must not hold an interactive request for 12 seconds; the
   // other sources still provide coverage when this bounded call times out.
   timeout: 7000,
   headers: {
@@ -25,35 +21,34 @@ const parser = new Parser({
 
 const yf = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
 
-// Per-ticker results are cached briefly so the on-demand API and the scheduler
-// don't hammer the same feeds repeatedly.
+// Per-ticker results, cached briefly so the on-demand API and the scheduler
+// don't hammer the same feeds.
 const newsCache = new TtlCache<NewsItem[]>(5 * 60 * 1000);
 
-// Historical company news (Finnhub), cached per ticker + date window. This is a
-// source that carries OLD-dated stories, so the frontend can spread its chart
-// markers across real publish dates instead of clustering on "today".
+// Finnhub carries OLD-dated stories, so the chart can spread its markers across
+// real publish dates instead of clustering on "today".
 const finnhubCache = new TtlCache<NewsItem[]>(30 * 60 * 1000);
 const FINNHUB_COMPANY_NEWS_URL = 'https://finnhub.io/api/v1/company-news';
 
-// Historical Google News windows are immutable once the window is in the past,
-// so they can be cached much longer than the live feeds.
+// Historical Google News windows are immutable once past, so they can be cached
+// far longer than the live feeds.
 const googleHistoryCache = new TtlCache<NewsItem[]>(12 * 60 * 60 * 1000);
 
-// AI classification of a given story is stable, so it's cached far longer than
-// the feed results and keyed by the item's stable id. This keeps repeated
-// on-demand requests cheap and bounds LLM calls.
+// AI classification of a story is stable, so it is cached by stable id well
+// beyond the feed results. This bounds LLM calls across repeated requests.
 const enrichmentCache = new TtlCache<{
   importance: NonNullable<NewsItem['importance']>;
   sentiment: NonNullable<NewsItem['sentiment']>;
   localizedTitle?: string;
   aiSummary?: string;
 }>(6 * 60 * 60 * 1000);
-// Coalesce overlapping requests (dashboard/detail, language refreshes, or two
-// clients hitting the same story) instead of paying for duplicate model calls.
+
+// Coalesce overlapping requests (dashboard/detail, language refreshes, two
+// clients on one story) instead of paying for duplicate model calls.
 const enrichmentPending = new Map<string, Promise<void>>();
 
-// Increment when localization prompting/validation changes so a hot process
-// cannot reuse an earlier wrong-language enrichment under the same lang key.
+// Bump when localization prompting/validation changes, so a hot process cannot
+// reuse an earlier wrong-language enrichment under the same lang key.
 const LOCALIZATION_CACHE_VERSION = 'v2';
 
 type FetchNewsOptions = {
@@ -76,12 +71,11 @@ type FetchNewsOptions = {
 };
 
 /**
- * Attach AI importance + sentiment and localize the display title/summary.
- * Cached per item id and requested language. Uncached items are classified in
- * batched LLM calls. On failure, same-language source items remain usable;
- * cross-language items are omitted so untranslated text cannot leak into UI.
+ * Attach AI importance + sentiment and localize the display title/summary,
+ * cached per item id and language. On failure, same-language source items stay
+ * usable; cross-language items are dropped so untranslated text can't reach UI.
  */
-export async function enrichNewsItems(
+async function enrichNewsItems(
   items: NewsItem[],
   language: 'en' | 'es' = 'en'
 ): Promise<NewsItem[]> {
@@ -99,14 +93,14 @@ export async function enrichNewsItems(
           uncached.map((item) => ({
             text: `${item.title}. ${item.summary ?? ''}`,
             targetLanguage: language,
-            // Never fall back to a source-language snippet that would make the
+            // Never fall back to a source-language snippet: that would make the
             // interface mix English and Spanish.
             fallbackSummary: item.language === language ? item.summary ?? '' : '',
           }))
         );
         enrichments.forEach((enrichment, i) => {
-          // null = enrichment failed for this item; leave it uncached so a later
-          // request retries instead of freezing a fake NEUTRO for 6 hours.
+          // null = enrichment failed; leave it uncached so a later request
+          // retries instead of freezing a fake NEUTRO for 6 hours.
           if (!enrichment) return;
           enrichmentCache.set(cacheKey(uncached[i]), {
             importance: enrichment.importance,
@@ -134,20 +128,21 @@ export async function enrichNewsItems(
     });
   }
 
-  // Wait for both the work started above and matching work already started by
-  // another request. Set removes duplicates when several items share a batch.
-  await Promise.all(
-    [...new Set(items.map((item) => enrichmentPending.get(cacheKey(item))).filter(
-      (promise): promise is Promise<void> => promise !== undefined
-    ))]
-  );
+  // Wait for the work started above AND for matching work started by another
+  // request. Set removes duplicates when several items share a batch.
+  await Promise.all([
+    ...new Set(
+      items
+        .map((item) => enrichmentPending.get(cacheKey(item)))
+        .filter((promise): promise is Promise<void> => promise !== undefined)
+    ),
+  ]);
 
   return items.flatMap((item) => {
     const enrichment = enrichmentCache.get(cacheKey(item));
     if (!enrichment) {
-      // Never leak an untranslated source item into an interface using the
-      // other language. A later request will retry because failures are not
-      // cached; meanwhile the caller can choose another qualifying story.
+      // Never leak an untranslated item into an interface using the other
+      // language. Failures aren't cached, so a later request retries.
       return item.language === language ? [item] : [];
     }
 
@@ -157,9 +152,8 @@ export async function enrichNewsItems(
     return [{
       ...item,
       ...enrichment,
-      // `title` and `summary` are the fields consumed by news cards. Returning
-      // translations only in auxiliary fields left those cards in the source
-      // language, despite the request's `lang` value.
+      // `title` and `summary` are what news cards render: returning translations
+      // only in auxiliary fields left those cards in the source language.
       title: localizedTitle || item.title,
       summary:
         localizedSummary || (item.language === language ? item.summary : undefined),
@@ -188,10 +182,15 @@ type ResolvedDateRange = {
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 const MAX_LOOKBACK_DAYS = 365;
 
-function toTimestamp(value?: string): number {
-  const ts = new Date(value ?? '').getTime();
-  return Number.isFinite(ts) && ts > 0 ? ts : 0;
-}
+const RANGE_DAYS: Record<string, number> = {
+  '1D': 1,
+  '5D': 5,
+  '1W': 7,
+  '1M': 30,
+  '3M': 90,
+  '6M': 182,
+  '1Y': 365,
+};
 
 function parseDateInput(value?: string): Date | undefined {
   if (!value) return undefined;
@@ -199,29 +198,12 @@ function parseDateInput(value?: string): Date | undefined {
   return Number.isFinite(parsed.getTime()) ? parsed : undefined;
 }
 
-function parseRangeToDays(range?: string): number | undefined {
-  if (!range) return undefined;
-  const map: Record<string, number> = {
-    '1D': 1,
-    '5D': 5,
-    '1W': 7,
-    '1M': 30,
-    '3M': 90,
-    '6M': 182,
-    '1Y': 365,
-  };
-  return map[range.trim().toUpperCase()];
-}
-
 function normalizeDaysBack(daysBack?: number, range?: string): number | undefined {
   if (typeof daysBack === 'number' && Number.isFinite(daysBack) && daysBack > 0) {
     return Math.min(Math.floor(daysBack), MAX_LOOKBACK_DAYS);
   }
-  const fromRange = parseRangeToDays(range);
-  if (typeof fromRange === 'number') {
-    return Math.min(fromRange, MAX_LOOKBACK_DAYS);
-  }
-  return undefined;
+  const fromRange = range ? RANGE_DAYS[range.trim().toUpperCase()] : undefined;
+  return typeof fromRange === 'number' ? Math.min(fromRange, MAX_LOOKBACK_DAYS) : undefined;
 }
 
 function resolveDateRange(options: FetchNewsOptions): ResolvedDateRange {
@@ -255,14 +237,10 @@ function isWithinDateRange(item: NewsItem, range: ResolvedDateRange): boolean {
   return true;
 }
 
-/**
- * Strip Google News' trailing " - Publisher" suffix from a title. Publisher
- * names can themselves contain hyphens (e.g. "ad-hoc-news.de"), so cut at the
- * LAST " - " separator instead of requiring a hyphen-free tail.
- */
+/** Publisher names can contain hyphens ("ad-hoc-news.de"), so cut at the LAST " - ". */
 function cleanTitle(title: string): string {
-  // Publishers often append exchange annotations such as "(NYSE:IBM)" or
-  // "(NASDAQ:AMZN)". They are metadata, not part of the readable headline.
+  // Publishers often append exchange annotations such as "(NYSE:IBM)". They are
+  // metadata, not part of the readable headline.
   const trimmed = title
     .replace(
       /\s*\((?:(?:NYSE|NASDAQ|AMEX|OTC|LSE|TSX|FWB|BCS)\s*:[^)]+|[^():]+\s*:(?:NYSE|NASDAQ|AMEX|OTC|LSE|TSX|FWB|BCS))\)/gi,
@@ -298,9 +276,9 @@ function buildScoredItem(input: ScoredItemInput): NewsItem | null {
   const link = input.link.trim();
   if (!title || !link) return null;
 
-  // Google News "summaries" are usually just the headline + publisher again;
-  // keep a summary only when it adds text beyond the title, so cards and push
-  // bodies don't repeat themselves. Scoring below still sees the raw text.
+  // Google News "summaries" are usually the headline + publisher again; keep one
+  // only when it adds text, so cards and push bodies don't repeat themselves.
+  // Scoring below still sees the raw text.
   const summary = normalizeText(input.summary).startsWith(normalizeText(title))
     ? ''
     : input.summary;
@@ -313,7 +291,7 @@ function buildScoredItem(input: ScoredItemInput): NewsItem | null {
   );
   const base = input.searchProvenance ? keywordScore + 2 : keywordScore;
   // Bias toward financial coverage and away from sponsorship/sports/CSR
-  // brand mentions that merely carry the company name.
+  // mentions that merely carry the company name.
   const signal = financialSignal(title, input.summary);
 
   return {
@@ -358,9 +336,8 @@ function mapFeedItems(
 async function fetchFromQuerySources(profile: CompanyProfile): Promise<NewsItem[]> {
   const results = await Promise.all(
     QUERY_SOURCES.map(async (source) => {
-      const url = source.build(profile);
       try {
-        const feed = await parser.parseURL(url);
+        const feed = await parser.parseURL(source.build(profile));
         return mapFeedItems(
           feed.items ?? [],
           profile,
@@ -386,8 +363,8 @@ type YahooSearchNews = {
 };
 
 /**
- * Yahoo Finance ticker search news (yahoo-finance2). Keyless, ticker-scoped,
- * dated, and publisher-attributed — a solid complement to the RSS feeds.
+ * Yahoo Finance ticker search news: keyless, ticker-scoped, dated and
+ * publisher-attributed — a solid complement to the RSS feeds.
  */
 async function fetchYahooSearchNews(profile: CompanyProfile): Promise<NewsItem[]> {
   try {
@@ -428,7 +405,8 @@ async function fetchYahooSearchNews(profile: CompanyProfile): Promise<NewsItem[]
 }
 
 type FinnhubArticle = {
-  datetime?: number; // unix seconds
+  /** Unix seconds. */
+  datetime?: number;
   headline?: string;
   summary?: string;
   source?: string;
@@ -441,23 +419,22 @@ function toYmd(date: Date): string {
 }
 
 /**
- * Historical company news from Finnhub (https://finnhub.io). Free tier, keyed by
- * FINNHUB_TOKEN, returns up to ~1 year of dated stories per ticker. Without a
- * token this is a no-op, so the rest of the pipeline keeps working on RSS alone.
+ * Historical company news from Finnhub: free tier, up to ~1 year of dated
+ * stories per ticker. Without FINNHUB_TOKEN this is a no-op, so the rest of the
+ * pipeline keeps working on RSS alone.
  */
 async function fetchFinnhubNews(
   profile: CompanyProfile,
   range: ResolvedDateRange
 ): Promise<NewsItem[]> {
-  // Single accepted name, so a rotation has exactly one place to change and no
-  // stale alias can silently keep working. Absent token = feature off.
+  // A single accepted name, so a rotation has exactly one place to change and
+  // no stale alias can silently keep working.
   const token = process.env.FINNHUB_TOKEN?.trim();
   if (!token) {
     return [];
   }
 
-  const now = new Date();
-  const to = range.to ?? now;
+  const to = range.to ?? new Date();
   // Default to a 90-day window when the caller didn't constrain the range.
   const from = range.from ?? new Date(to.getTime() - 90 * ONE_DAY_MS);
   const cacheKey = `${profile.ticker}|${toYmd(from)}|${toYmd(to)}`;
@@ -495,19 +472,16 @@ async function fetchFinnhubNews(
   });
 }
 
-// A 5D chart needs dated coverage across the window: live feeds tend to return
-// only today's stories, which then collapse into a single chart marker. Skip
-// historical backfill only for genuinely short (1D/2D) requests. A 5D request
-// uses one bounded Google News window, cached for 12 hours.
+// Live feeds tend to return only today's stories, which collapse into a single
+// chart marker, so backfill is skipped only for genuinely short (1D/2D) requests.
 const HISTORY_MIN_DAYS = 2;
-// Bound the number of date windows per edition so a cold 1Y request stays fast.
+// Bound the windows per edition so a cold 1Y request stays fast.
 const HISTORY_MAX_WINDOWS = 4;
 
 /**
- * Historical Google News coverage: split the requested range into a few date
- * windows and query each with `after:`/`before:`. Keyless, and each window
- * returns up to ~100 stories dated INSIDE the window, so long chart ranges get
- * markers spread across their real publish dates. Windows are cached 12h.
+ * Split the requested range into a few date windows and query each with
+ * `after:`/`before:`. Keyless, and each window returns up to ~100 stories dated
+ * INSIDE it, so long chart ranges get markers across real publish dates.
  */
 async function fetchHistoricalGoogleNews(
   profile: CompanyProfile,
@@ -529,16 +503,23 @@ async function fetchHistoricalGoogleNews(
     const windowTo = new Date(from.getTime() + (i + 1) * windowMs);
 
     for (const edition of GOOGLE_EDITIONS) {
-      const cacheKey = `${profile.ticker}|${edition.language}|${toYmd(windowFrom)}|${toYmd(windowTo)}`;
+      const cacheKey =
+        `${profile.ticker}|${edition.language}|${toYmd(windowFrom)}|${toYmd(windowTo)}`;
       jobs.push(
         googleHistoryCache.getOrSet(cacheKey, async () => {
           try {
-            const url = googleNewsHistoricalUrl(profile, edition, toYmd(windowFrom), toYmd(windowTo));
+            const url = googleNewsHistoricalUrl(
+              profile,
+              edition,
+              toYmd(windowFrom),
+              toYmd(windowTo)
+            );
             const feed = await parser.parseURL(url);
             return mapFeedItems(feed.items ?? [], profile, edition.name, edition.language, true);
           } catch (error) {
             console.error(
-              `[newsService] Google history error (${edition.language} ${toYmd(windowFrom)}..${toYmd(windowTo)}) for ${profile.ticker}:`,
+              `[newsService] Google history error (${edition.language} ` +
+                `${toYmd(windowFrom)}..${toYmd(windowTo)}) for ${profile.ticker}:`,
               error
             );
             return [];
@@ -551,55 +532,58 @@ async function fetchHistoricalGoogleNews(
   return (await Promise.all(jobs)).flat();
 }
 
+const byDateDesc = (a: NewsItem, b: NewsItem): number => {
+  const dateA = toTimestamp(a.isoDate ?? a.pubDate);
+  const dateB = toTimestamp(b.isoDate ?? b.pubDate);
+  return dateB !== dateA ? dateB - dateA : b.score - a.score;
+};
+
 /**
- * Pick up to `limit` items SPREAD across the requested date range instead of
- * just the newest ones. Without this, historical coverage gets crowded out on
- * long timeframes and the chart markers all cluster on the most recent days.
- * Buckets the range, takes the best-scored story per bucket round-robin, and
- * returns the selection newest-first.
+ * In a compact (<= 7 day) view the chart shows one marker per date, so return
+ * one article per publication date — the strongest-scoring one — keeping the
+ * Related News list aligned with the markers.
+ */
+function selectOnePerDay(items: NewsItem[], totalDays: number, limit: number): NewsItem[] {
+  const bestByDay = new Map<string, NewsItem>();
+
+  for (const item of items) {
+    const timestamp = toTimestamp(item.isoDate ?? item.pubDate);
+    if (!timestamp) continue;
+
+    const day = toYmd(new Date(timestamp));
+    const current = bestByDay.get(day);
+    if (
+      !current ||
+      item.score > current.score ||
+      (item.score === current.score && timestamp > toTimestamp(current.isoDate ?? current.pubDate))
+    ) {
+      bestByDay.set(day, item);
+    }
+  }
+
+  // `now - 5 days` is inclusive at both ends and can span six calendar dates.
+  // Keep only the newest representatives so an older weekend story does not
+  // collide with Monday's chart point.
+  const dailyLimit = Math.min(limit, Math.max(1, Math.ceil(totalDays)));
+  return [...bestByDay.values()].sort(byDateDesc).slice(0, dailyLimit);
+}
+
+/**
+ * Pick up to `limit` items SPREAD across the requested range rather than just
+ * the newest: otherwise historical coverage gets crowded out on long timeframes
+ * and every chart marker clusters on the most recent days.
  */
 function selectSpreadAcrossRange(
   items: NewsItem[],
   range: ResolvedDateRange,
   limit: number
 ): NewsItem[] {
-  const byDateDesc = (a: NewsItem, b: NewsItem): number => {
-    const dateA = toTimestamp(a.isoDate ?? a.pubDate);
-    const dateB = toTimestamp(b.isoDate ?? b.pubDate);
-    if (dateB !== dateA) return dateB - dateA;
-    return b.score - a.score;
-  };
-
   const { from } = range;
   const to = range.to ?? new Date();
   const totalDays = from ? (to.getTime() - from.getTime()) / ONE_DAY_MS : 0;
 
-  // In the compact 5D view the chart can show only one marker per trading
-  // date. Return one genuine article per publication date as well, choosing
-  // the strongest relevance score for that day, so the Related News list and
-  // chart markers stay aligned instead of repeating several same-day stories.
   if (from && totalDays <= 7) {
-    const bestByDay = new Map<string, NewsItem>();
-    for (const item of items) {
-      const timestamp = toTimestamp(item.isoDate ?? item.pubDate);
-      if (!timestamp) continue;
-
-      const day = toYmd(new Date(timestamp));
-      const current = bestByDay.get(day);
-      if (
-        !current ||
-        item.score > current.score ||
-        (item.score === current.score && timestamp > toTimestamp(current.isoDate ?? current.pubDate))
-      ) {
-        bestByDay.set(day, item);
-      }
-    }
-
-    // `now - 5 days` is inclusive at both ends and can span six calendar
-    // dates. Keep only the five newest daily representatives for a 5D request
-    // so an older weekend story does not collide with Monday's chart point.
-    const dailyLimit = Math.min(limit, Math.max(1, Math.ceil(totalDays)));
-    return [...bestByDay.values()].sort(byDateDesc).slice(0, dailyLimit);
+    return selectOnePerDay(items, totalDays, limit);
   }
 
   if (!from || totalDays <= HISTORY_MIN_DAYS || items.length <= limit) {
@@ -612,7 +596,10 @@ function selectSpreadAcrossRange(
   const buckets = new Map<number, NewsItem[]>();
   for (const item of items) {
     const ts = toTimestamp(item.isoDate ?? item.pubDate);
-    const index = Math.min(bucketCount - 1, Math.max(0, Math.floor((ts - from.getTime()) / bucketMs)));
+    const index = Math.min(
+      bucketCount - 1,
+      Math.max(0, Math.floor((ts - from.getTime()) / bucketMs))
+    );
     const bucket = buckets.get(index) ?? [];
     bucket.push(item);
     buckets.set(index, bucket);
@@ -622,6 +609,8 @@ function selectSpreadAcrossRange(
     bucket.sort((a, b) => b.score - a.score || byDateDesc(a, b));
   }
 
+  // Round-robin across buckets, oldest bucket first, so the selection stays
+  // spread instead of draining the densest window.
   const ordered = [...buckets.entries()].sort(([a], [b]) => a - b).map(([, bucket]) => bucket);
   const selected: NewsItem[] = [];
   for (let round = 0; selected.length < limit; round++) {
@@ -643,7 +632,7 @@ export async function fetchNewsForTicker(
   options: FetchNewsOptions = {}
 ): Promise<NewsItem[]> {
   // minScore 3 drops items that only earned the base "search provenance" credit
-  // (no keyword match at all) — e.g. legal bulletins that merely list the ticker.
+  // with no keyword match — e.g. legal bulletins that merely list the ticker.
   // requireFinancial drops brand-only mentions (sports/sponsorship/CSR).
   const {
     companyName,
@@ -659,8 +648,8 @@ export async function fetchNewsForTicker(
   const profile = await resolveCompanyProfile(ticker, companyName);
   const dateRange = resolveDateRange(options);
 
-  // Recent coverage (RSS + Yahoo search) and dated historical coverage
-  // (Google News date windows + Finnhub), all fetched in parallel.
+  // Recent coverage (RSS + Yahoo search) and dated historical coverage (Google
+  // News date windows + Finnhub), all fetched in parallel.
   const [rssNews, yahooNews, googleHistory, finnhubNews] = await Promise.all([
     newsCache.getOrSet(`rss|${profile.ticker}|${profile.companyName}`, () =>
       fetchFromQuerySources(profile)
@@ -683,25 +672,13 @@ export async function fetchNewsForTicker(
   );
 
   const deduped = dedupeNews(filtered);
-  // The live RSS panel should show every qualifying article from today (up to
-  // its limit). Daily collapsing is only for historical chart-marker data.
+  // The live RSS panel shows every qualifying article from today, up to its
+  // limit. Daily collapsing is only for historical chart-marker data.
   const top = rssOnly
-    ? [...deduped]
-        .sort(
-          (a, b) =>
-            toTimestamp(b.isoDate ?? b.pubDate) - toTimestamp(a.isoDate ?? a.pubDate) ||
-            b.score - a.score
-        )
-        .slice(0, limit)
+    ? [...deduped].sort(byDateDesc).slice(0, limit)
     : selectSpreadAcrossRange(deduped, dateRange, limit);
 
-  if (enrich) {
-    // Every returned item must be localized. Previously only the freshest 40
-    // were enriched, so older Spanish-source stories leaked Spanish titles and
-    // summaries into an English interface. enrichNewsItems already sends work
-    // to the model in bounded batches and caches it per story + language.
-    return enrichNewsItems(top, language);
-  }
-
-  return top;
+  // Every returned item must be localized, not just the freshest few, or older
+  // Spanish-source stories leak Spanish text into an English interface.
+  return enrich ? enrichNewsItems(top, language) : top;
 }

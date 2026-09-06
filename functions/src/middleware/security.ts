@@ -2,16 +2,9 @@ import type { CorsOptions } from "cors";
 import type { NextFunction, Request, Response } from "express";
 
 /**
- * Origins allowed to call the API from a browser.
- *
- * `cors()` with no arguments answers every preflight with
- * `Access-Control-Allow-Origin: *`, which lets any page on the internet script
- * this API using a token it has obtained. Bearer tokens are not sent
- * automatically the way cookies are, so this was not CSRF — but a wildcard
- * removes the browser's origin check for free, and there is no reason to
- * donate it.
- *
- * Set ALLOWED_ORIGINS (comma-separated) to override for a new deploy target.
+ * Origins allowed to call the API from a browser. A bare `cors()` answers every
+ * preflight with `*`, which lets any page on the internet script this API with
+ * a token it has obtained. Set ALLOWED_ORIGINS (comma-separated) to override.
  */
 const DEFAULT_ALLOWED_ORIGINS = [
   "https://financialnewstracker.web.app",
@@ -32,17 +25,13 @@ function allowedOrigins(): string[] {
 
 export const corsOptions: CorsOptions = {
   origin(origin, callback) {
-    // No Origin header: same-origin fetches, curl, and the mobile/native case.
-    // These are not browser cross-origin requests, so there is nothing to gate.
+    // No Origin header: same-origin fetches, curl and native clients. Not
+    // browser cross-origin requests, so there is nothing to gate.
     if (!origin) return callback(null, true);
 
-    if (allowedOrigins().includes(origin)) {
-      return callback(null, true);
-    }
-    // Reject by declining the origin rather than erroring: the browser then
-    // blocks the response, and the caller gets a clean CORS failure instead of
-    // a 500 that looks like a server bug.
-    return callback(null, false);
+    // Decline rather than error, so the caller gets a clean CORS failure
+    // instead of a 500 that looks like a server bug.
+    return callback(null, allowedOrigins().includes(origin));
   },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Authorization", "Content-Type"],
@@ -52,14 +41,11 @@ export const corsOptions: CorsOptions = {
 };
 
 /**
- * Response headers for a JSON-only API.
- *
- * There is no HTML surface here, so this is deliberately narrow: stop content
- * sniffing, refuse framing, keep referrers off third parties, and forbid
- * cross-origin embedding of responses. A full CSP belongs on the Angular app's
- * hosting config, not on an endpoint that only ever returns application/json.
+ * Response headers for a JSON-only API: no content sniffing, no framing, no
+ * referrers, no cross-origin embedding. A full CSP belongs on the Angular app's
+ * hosting config, not on an endpoint that only returns application/json.
  */
-export function securityHeaders(req: Request, res: Response, next: NextFunction): void {
+export function securityHeaders(_req: Request, res: Response, next: NextFunction): void {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "no-referrer");

@@ -4,11 +4,9 @@ import { runDailyDigestCycle } from "../services/digestService/digestService";
 import { hfToken } from "../config/secrets";
 
 /**
- * News tracker. Runs every 15 minutes to keep the enriched news store + history
- * fresh (this also backs the chart). Routine coverage is NOT pushed per item
- * (the daily digest covers it); the exceptions, matching the onboarding alert
- * preferences, are high-impact stories and >3% price moves, pushed immediately
- * to the users who opted in.
+ * News tracker. Keeps the enriched news store (which also backs the chart)
+ * fresh. Routine coverage is not pushed per item — the daily digest covers it —
+ * only high-impact stories and >3% price moves, to the users who opted in.
  */
 export const trackNews = onSchedule(
   {
@@ -27,9 +25,9 @@ export const trackNews = onSchedule(
 );
 
 /**
- * Daily digest. Once a day at 9:00 (Europe/Madrid) — the time promised by the
- * onboarding "Daily digest (9am)" toggle — it sends each opted-in user a single
- * notification with the most relevant news across all the tickers they follow.
+ * Daily digest at the time promised by the onboarding "Daily digest (9am)"
+ * toggle: one notification per opted-in user, with the most relevant news
+ * across every ticker they follow.
  */
 export const dailyDigest = onSchedule(
   {

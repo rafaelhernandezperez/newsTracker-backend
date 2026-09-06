@@ -10,35 +10,35 @@ export function normalizeText(value?: string): string {
     .trim();
 }
 
+/** Epoch ms for a feed date, or 0 when it is absent or unparseable. */
+export function toTimestamp(value?: string): number {
+  const ts = new Date(value ?? '').getTime();
+  return Number.isFinite(ts) && ts > 0 ? ts : 0;
+}
+
 /**
- * Stable, source-independent id for an article, so the SAME story collapses to
- * one document across feeds and across scheduler runs (used as the enrichment
- * cache key AND the Firestore doc id — one scheme, so a story is never enriched
- * twice or stored twice under different ids).
- *
- * Keyed on the normalized TITLE first: the same story carries different URLs on
- * Google News (redirect links), Yahoo and Finnhub, so links can't identify it
- * across sources. Falls back to the link when there is no title.
+ * Canonical form identifying one story across feeds. Keyed on the TITLE first:
+ * the same story carries different URLs on Google News (redirect links), Yahoo
+ * and Finnhub, so links cannot identify it. Falls back to the link.
+ */
+function canonicalize(link?: string, title?: string): string {
+  return normalizeText(title?.trim() || link || '');
+}
+
+/**
+ * Stable, source-independent article id — the enrichment cache key AND the
+ * Firestore doc id, so a story is never enriched or stored twice.
  */
 export function stableNewsKey(link?: string, title?: string): string {
-  const canonical = normalizeText(title?.trim() || link || '');
-  return crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 32);
+  return crypto.createHash('sha256').update(canonicalize(link, title)).digest('hex').slice(0, 32);
 }
 
 export function dedupeNews(items: NewsItem[]): NewsItem[] {
   const map = new Map<string, NewsItem>();
 
-  const toTimestamp = (value?: string): number => {
-    const ts = new Date(value ?? '').getTime();
-    return Number.isFinite(ts) && ts > 0 ? ts : 0;
-  };
-
   for (const item of items) {
-    const key = normalizeText(item.title?.trim() || item.link || '');
-
-    if (!key) {
-      continue;
-    }
+    const key = canonicalize(item.link, item.title);
+    if (!key) continue;
 
     const existing = map.get(key);
     if (!existing) {
@@ -46,14 +46,13 @@ export function dedupeNews(items: NewsItem[]): NewsItem[] {
       continue;
     }
 
-    const existingDate = toTimestamp(existing.isoDate ?? existing.pubDate);
-    const currentDate = toTimestamp(item.isoDate ?? item.pubDate);
-
     // Keep the better-scored duplicate; recency only breaks ties.
-    if (
+    const isBetter =
       item.score > existing.score ||
-      (item.score === existing.score && currentDate > existingDate)
-    ) {
+      (item.score === existing.score &&
+        toTimestamp(item.isoDate ?? item.pubDate) >
+          toTimestamp(existing.isoDate ?? existing.pubDate));
+    if (isBetter) {
       map.set(key, item);
     }
   }

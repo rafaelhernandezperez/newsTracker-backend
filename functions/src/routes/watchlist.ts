@@ -1,5 +1,5 @@
 import { Router, type Request, type Response } from "express";
-import { requireAuth } from "../middleware/auth";
+import { getUid, requireAuth } from "../middleware/auth";
 import { validateCompanyName, validateTicker } from "../middleware/validation";
 import {
   addTickerToWatchlist,
@@ -13,9 +13,7 @@ router.use(requireAuth);
 
 router.get("/", async (req: Request, res: Response) => {
   try {
-    const user = (req as Request & { user?: { uid?: string } }).user;
-    const uid = user?.uid;
-
+    const uid = getUid(req);
     if (!uid) {
       return res.status(401).json({ ok: false, message: "Unauthorized" });
     }
@@ -30,9 +28,7 @@ router.get("/", async (req: Request, res: Response) => {
 
 router.post("/", async (req: Request, res: Response) => {
   try {
-    const user = (req as Request & { user?: { uid?: string } }).user;
-    const uid = user?.uid;
-
+    const uid = getUid(req);
     if (!uid) {
       return res.status(401).json({ ok: false, message: "Unauthorized" });
     }
@@ -59,9 +55,7 @@ router.post("/", async (req: Request, res: Response) => {
 
 router.delete("/:ticker", async (req: Request, res: Response) => {
   try {
-    const user = (req as Request & { user?: { uid?: string } }).user;
-    const uid = user?.uid;
-
+    const uid = getUid(req);
     if (!uid) {
       return res.status(401).json({ ok: false, message: "Unauthorized" });
     }

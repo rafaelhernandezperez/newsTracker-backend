@@ -1,4 +1,4 @@
-import { Router, Request, Response } from 'express';
+import { Router, type Request, type Response } from 'express';
 import YahooFinance from 'yahoo-finance2';
 import { requireAuth } from '../middleware/auth';
 import { validateSearchQuery } from '../middleware/validation';
@@ -10,7 +10,7 @@ router.use(requireAuth);
 
 const yf = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
 
-export type TickerSearchResult = {
+type TickerSearchResult = {
   symbol: string;
   name: string;
   exchange?: string;
@@ -32,8 +32,7 @@ type YahooSearchQuote = {
 
 /**
  * GET /tickers/search?q=apple — resolve free-text (company name or symbol) to
- * real listed equities via Yahoo Finance, so users can follow ANY company, not
- * just a hardcoded catalogue.
+ * real listed equities, so users can follow ANY company rather than a catalogue.
  */
 router.get('/search', async (req: Request, res: Response) => {
   try {
@@ -59,7 +58,9 @@ router.get('/search', async (req: Request, res: Response) => {
       const quotes: YahooSearchQuote[] = Array.isArray(result?.quotes) ? result.quotes : [];
 
       return quotes
-        .filter((quote) => quote.quoteType === 'EQUITY' && quote.symbol && quote.isYahooFinance !== false)
+        .filter(
+          (quote) => quote.quoteType === 'EQUITY' && quote.symbol && quote.isYahooFinance !== false
+        )
         .map((quote): TickerSearchResult => ({
           symbol: String(quote.symbol).toUpperCase(),
           name: quote.longname?.trim() || quote.shortname?.trim() || String(quote.symbol),

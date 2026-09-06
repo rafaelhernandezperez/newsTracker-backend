@@ -1,41 +1,30 @@
 import type { CompanyProfile } from './types';
 
 /**
- * Per-ticker query sources.
- *
- * The previous implementation pulled a fixed set of GENERIC market feeds
- * (CNBC top news, Investing all news, ...) and then filtered them down to the
- * ticker. Generic feeds rarely name a specific company, so recall was terrible.
- *
- * Instead we now build SEARCH feeds that take the company query as a parameter,
- * so every source returns news that is already about that company. This is the
- * single biggest lever on "not enough news".
+ * Per-ticker query sources. These are SEARCH feeds parameterised by the company
+ * query, so every source returns news already about that company — generic
+ * market feeds rarely name a specific one, which wrecked recall.
  */
-
 type QuerySource = {
   name: string;
   language: string;
   /**
-   * 'search' = the feed is a literal per-company search (every item is about
-   * the company, so provenance alone is evidence of relevance).
-   * 'feed' = a per-ticker feed that may pad with general market stories, so it
-   * must earn relevance via keyword matching.
+   * 'search' = a literal per-company search, so provenance alone is evidence of
+   * relevance. 'feed' = a per-ticker feed that may pad with general market
+   * stories, so it must earn relevance via keyword matching.
    */
   kind: 'search' | 'feed';
   /** Build the feed URL for a given resolved company profile. */
   build: (profile: CompanyProfile) => string;
 };
 
-/**
- * Google News search RSS. Keyless, enormous coverage (thousands of outlets),
- * supports per-language editions. We run one EN edition and one ES edition.
- */
+export type GoogleEdition = { name: string; language: string; hl: string; gl: string; ceid: string };
+
+/** Keyless, enormous coverage (thousands of outlets), per-language editions. */
 function googleNewsUrl(query: string, hl: string, gl: string, ceid: string): string {
   const q = encodeURIComponent(query);
   return `https://news.google.com/rss/search?q=${q}&hl=${hl}&gl=${gl}&ceid=${ceid}`;
 }
-
-export type GoogleEdition = { name: string; language: string; hl: string; gl: string; ceid: string };
 
 export const GOOGLE_EDITIONS: GoogleEdition[] = [
   { name: 'Google News', language: 'en', hl: 'en-US', gl: 'US', ceid: 'US:en' },
@@ -43,9 +32,9 @@ export const GOOGLE_EDITIONS: GoogleEdition[] = [
 ];
 
 /**
- * Google News search RSS constrained to a date window via the `after:`/`before:`
- * query operators. This is what lets the chart show news at their REAL historical
- * publish dates (keyless; returns up to ~100 dated items per window).
+ * Google News search constrained to a date window via the `after:`/`before:`
+ * operators. This is what lets the chart show news at their real historical
+ * publish dates (keyless; up to ~100 dated items per window).
  */
 export function googleNewsHistoricalUrl(
   profile: CompanyProfile,
@@ -58,14 +47,12 @@ export function googleNewsHistoricalUrl(
 }
 
 /**
- * Build a focused search query from a company profile.
- * Prefers the resolved company name, falls back to the ticker, and always
- * anchors with the ticker so we keep finance-relevant matches.
+ * Prefer the resolved company name (quoted, so it stays a phrase) but always
+ * anchor with the ticker, which keeps matches finance-relevant.
  */
-export function buildSearchQuery(profile: CompanyProfile): string {
+function buildSearchQuery(profile: CompanyProfile): string {
   const name = profile.companyName?.trim();
   if (name) {
-    // "Apple Inc" OR AAPL  -> name in quotes keeps it as a phrase
     return `"${name}" OR ${profile.ticker}`;
   }
   // No resolved name: search the ticker as a stock to avoid generic word hits.
@@ -77,15 +64,13 @@ export const QUERY_SOURCES: QuerySource[] = [
     name: 'Google News (EN)',
     language: 'en',
     kind: 'search',
-    build: (profile) =>
-      googleNewsUrl(buildSearchQuery(profile), 'en-US', 'US', 'US:en'),
+    build: (profile) => googleNewsUrl(buildSearchQuery(profile), 'en-US', 'US', 'US:en'),
   },
   {
     name: 'Google News (ES)',
     language: 'es',
     kind: 'search',
-    build: (profile) =>
-      googleNewsUrl(buildSearchQuery(profile), 'es-419', 'ES', 'ES:es'),
+    build: (profile) => googleNewsUrl(buildSearchQuery(profile), 'es-419', 'ES', 'ES:es'),
   },
   {
     name: 'Yahoo Finance Headlines',

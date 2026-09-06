@@ -17,9 +17,12 @@ const INVALID_TOKEN_CODES = new Set([
   "messaging/registration-token-not-registered",
 ]);
 
+/** sendEachForMulticast accepts at most 500 tokens per call. */
+const FCM_MULTICAST_LIMIT = 500;
+
 /**
- * Push a single news item to every device of the given subscribers via FCM.
- * Invalid/expired tokens reported by FCM are pruned from Firestore.
+ * Push one news item to every device of the given subscribers. Tokens FCM
+ * reports as invalid or expired are pruned from Firestore.
  */
 export async function notifySubscribers(
   subscribers: string[],
@@ -30,10 +33,10 @@ export async function notifySubscribers(
     return { sent: 0, failed: 0 };
   }
 
-  // Keep web pushes data-only. Notification payloads are auto-rendered by the
-  // Firebase SDK and would then also reach our service worker's explicit
-  // showNotification() handler, producing two browser notifications. Let the
-  // worker render exactly one and own the validated click target.
+  // Web pushes stay data-only: a notification payload is auto-rendered by the
+  // Firebase SDK and would then ALSO reach our service worker's showNotification
+  // handler, producing two browser notifications. Let the worker render exactly
+  // one and own the validated click target.
   const payload = {
     data: {
       ticker: notification.ticker,
@@ -50,12 +53,12 @@ export async function notifySubscribers(
     webpush: { headers: { Urgency: "high" } },
   };
 
-  // sendEachForMulticast accepts at most 500 tokens per call.
   let sent = 0;
   let failed = 0;
   const invalidTokens: string[] = [];
-  for (let offset = 0; offset < tokens.length; offset += 500) {
-    const chunk = tokens.slice(offset, offset + 500);
+
+  for (let offset = 0; offset < tokens.length; offset += FCM_MULTICAST_LIMIT) {
+    const chunk = tokens.slice(offset, offset + FCM_MULTICAST_LIMIT);
     const message: admin.messaging.MulticastMessage = { tokens: chunk, ...payload };
     const response = await admin.messaging().sendEachForMulticast(message);
 

@@ -1,10 +1,9 @@
 import { Router, type Request, type Response } from "express";
-import { requireAuth } from "../middleware/auth";
+import { getUid, requireAuth } from "../middleware/auth";
 import {
-  DEFAULT_ALERT_PREFS,
+  coerceAlertPrefs,
   getAlertPrefs,
   setAlertPrefs,
-  type AlertPrefs,
 } from "../services/firebaseService/firebaseService";
 
 const router = Router();
@@ -13,9 +12,7 @@ router.use(requireAuth);
 
 router.get("/alerts", async (req: Request, res: Response) => {
   try {
-    const user = (req as Request & { user?: { uid?: string } }).user;
-    const uid = user?.uid;
-
+    const uid = getUid(req);
     if (!uid) {
       return res.status(401).json({ ok: false, message: "Unauthorized" });
     }
@@ -30,21 +27,14 @@ router.get("/alerts", async (req: Request, res: Response) => {
 
 router.put("/alerts", async (req: Request, res: Response) => {
   try {
-    const user = (req as Request & { user?: { uid?: string } }).user;
-    const uid = user?.uid;
-
+    const uid = getUid(req);
     if (!uid) {
       return res.status(401).json({ ok: false, message: "Unauthorized" });
     }
 
-    const body = (req.body ?? {}) as Partial<Record<keyof AlertPrefs, unknown>>;
     // Missing/malformed fields fall back to defaults, so a partial PUT can't
     // silently disable channels the client didn't mention.
-    const prefs: AlertPrefs = {
-      priceMoves: typeof body.priceMoves === "boolean" ? body.priceMoves : DEFAULT_ALERT_PREFS.priceMoves,
-      highImpact: typeof body.highImpact === "boolean" ? body.highImpact : DEFAULT_ALERT_PREFS.highImpact,
-      dailyDigest: typeof body.dailyDigest === "boolean" ? body.dailyDigest : DEFAULT_ALERT_PREFS.dailyDigest,
-    };
+    const prefs = coerceAlertPrefs(req.body);
 
     await setAlertPrefs(uid, prefs);
     return res.json({ ok: true, prefs });

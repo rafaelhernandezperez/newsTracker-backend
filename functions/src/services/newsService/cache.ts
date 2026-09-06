@@ -1,9 +1,7 @@
 /**
- * Minimal in-memory TTL cache.
- *
- * Cloud Functions instances are reused across invocations, so this meaningfully
- * cuts repeated outbound feed/resolver calls within an instance's lifetime
- * without any external dependency. It is intentionally per-instance and lossy.
+ * Minimal in-memory TTL cache. Cloud Functions instances are reused across
+ * invocations, so this meaningfully cuts repeated outbound calls within an
+ * instance's lifetime. Intentionally per-instance and lossy.
  */
 type Entry<T> = {
   value: T;
@@ -40,9 +38,8 @@ export class TtlCache<T> {
   }
 
   /**
-   * Get the cached value or compute, store, and return it. Concurrent calls
-   * for the same key share one in-flight compute instead of each running the
-   * full fetch (thundering-herd protection on cold caches).
+   * Get the cached value, or compute and store it. Concurrent calls for one key
+   * share a single in-flight compute (thundering-herd protection).
    */
   async getOrSet(key: string, compute: () => Promise<T>): Promise<T> {
     const cached = this.get(key);

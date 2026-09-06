@@ -1,18 +1,14 @@
 import type { NextFunction, Request, Response } from "express";
+import { getUid } from "./auth";
 
 /**
  * Fixed-window rate limiting, keyed by authenticated uid when available and by
  * client IP otherwise.
  *
- * Scope: the counters live in the instance's memory. Cloud Functions may run up
- * to `maxInstances` copies of this app (5, see index.ts), so a determined
- * caller spread across instances can reach at most 5x a configured limit. That
- * is an acceptable bound here — the point is to cap runaway cost and scripted
- * abuse, not to meter billing precisely. Anything stricter would need a shared
- * store (Firestore/Redis), which would add a write to every single request.
- *
- * Windows are swept lazily on write, so an idle instance holds no timers and a
- * burst of unique keys cannot grow the map without bound (see MAX_KEYS).
+ * Counters live in the instance's memory, so a caller spread across the 5
+ * configured instances can reach at most 5x a limit. That bound is acceptable:
+ * the point is to cap runaway cost and scripted abuse, not to meter billing.
+ * Anything stricter needs a shared store, i.e. a write on every request.
  */
 
 type Window = {
@@ -38,17 +34,13 @@ export type RateLimitOptions = {
 const MAX_KEYS = 10_000;
 
 /**
- * Identify the caller: uid for authenticated requests (survives IP changes and
- * is the identity that actually spends quota), IP otherwise.
- *
- * `req.ip` is trusted only because Cloud Functions terminates the connection at
- * Google's front end, which rewrites X-Forwarded-For. Do not reuse this keying
- * behind an untrusted proxy without pinning `trust proxy` accordingly.
+ * uid for authenticated requests (it survives IP changes and is the identity
+ * that actually spends quota), IP otherwise. `req.ip` is trustworthy only
+ * because Google's front end rewrites X-Forwarded-For — see TRUST_PROXY_HOPS.
  */
 function identify(req: Request): string {
-  const uid = (req as Request & { user?: { uid?: string } }).user?.uid;
-  if (uid) return `uid:${uid}`;
-  return `ip:${req.ip ?? "unknown"}`;
+  const uid = getUid(req);
+  return uid ? `uid:${uid}` : `ip:${req.ip ?? "unknown"}`;
 }
 
 export function rateLimit(options: RateLimitOptions) {
@@ -60,11 +52,9 @@ export function rateLimit(options: RateLimitOptions) {
   let nextLogAt = 0;
 
   /**
-   * Reclaim expired windows. This is O(number of tracked keys), so it must NOT
-   * run per request: a distributed flood creates a new key every time, and an
-   * unconditional sweep at capacity made each of those requests ~174x more
-   * expensive than a normal one — turning the limiter itself into the cheapest
-   * way to burn our CPU. It is therefore capped at once per window.
+   * Reclaim expired windows. O(tracked keys), so it must NOT run per request: a
+   * distributed flood creates a key every time, and sweeping unconditionally at
+   * capacity made those requests ~174x more expensive than a normal one.
    */
   function sweepExpired(now: number): void {
     for (const [key, window] of windows) {
@@ -74,10 +64,8 @@ export function rateLimit(options: RateLimitOptions) {
   }
 
   /**
-   * Make room for one new key. Every window in this limiter has the same TTL,
-   * so Map insertion order is also expiry order: the front entry is always the
-   * oldest and the next to expire. Dropping from the front is therefore O(1)
-   * per eviction and needs no scan.
+   * Make room for one new key. Every window here shares one TTL, so Map
+   * insertion order is expiry order and dropping from the front is O(1).
    */
   function evictOldest(): void {
     while (windows.size >= MAX_KEYS) {
@@ -97,8 +85,8 @@ export function rateLimit(options: RateLimitOptions) {
 
     let window = windows.get(key);
     if (!window || window.resetAt <= now) {
-      // Cheap, unconditional bound first; the full sweep is only an
-      // optimisation to reclaim memory and is throttled to once per window.
+      // Cheap unconditional bound first; the sweep only reclaims memory and is
+      // throttled to once per window.
       if (windows.size >= MAX_KEYS) {
         if (now >= nextSweepAt) sweepExpired(now);
         evictOldest();
@@ -117,10 +105,9 @@ export function rateLimit(options: RateLimitOptions) {
 
     if (window.count > max) {
       res.setHeader("Retry-After", String(resetSeconds));
-      // Log at most once every 10s per limiter. Logging every rejection means a
-      // flood also becomes a log-volume (and log-bill) amplifier. Log the KIND
-      // of identity, never the identity: uids and IPs are personal data, and
-      // logs are retained far longer than any rate window.
+      // At most one line per 10s, so a flood cannot become a log-bill amplifier.
+      // Log the KIND of identity, never the identity: uids and IPs are personal
+      // data, and logs outlive every rate window.
       if (now >= nextLogAt) {
         nextLogAt = now + 10_000;
         const identityKind = key.includes("|uid:") ? "an authenticated user" : "an IP";
@@ -137,10 +124,9 @@ export function rateLimit(options: RateLimitOptions) {
 }
 
 /**
- * Tiers, tightest first. `ai` guards the only endpoints that spend real money
- * (LLM enrichment), so it is deliberately far below what a human browsing the
- * app can reach: opening a company page costs one request, and repeat views
- * are served from the enrichment cache.
+ * Tiers, tightest first. `ai` guards the only endpoints that spend real money,
+ * so it sits far below what a human browsing the app can reach: a company page
+ * costs one request, and repeat views are served from the enrichment cache.
  */
 export const limits = {
   /** Whole-API backstop, applied before auth so unauthenticated floods are cheap. */

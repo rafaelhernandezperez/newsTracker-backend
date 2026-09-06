@@ -1,5 +1,5 @@
 export type CompanyProfile = {
-  ticker: string ;
+  ticker: string;
   companyName?: string;
   aliases: string[];
 };

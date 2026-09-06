@@ -1,4 +1,3 @@
-// yahooFinance data
 import YahooFinance from 'yahoo-finance2';
 import { TtlCache } from '../newsService/cache';
 
@@ -30,11 +29,11 @@ export type MarketHistoryPoint = {
   volume: number | null;
 };
 
-export async function getQuote(ticker: string) {
-  const key = ticker.trim().toUpperCase();
-  return quoteCache.getOrSet(key, async () => {
-    const quote = await yf.quote(key);
-    const result: MarketQuote = {
+export async function getQuote(ticker: string): Promise<MarketQuote> {
+  const symbol = ticker.trim().toUpperCase();
+  return quoteCache.getOrSet(symbol, async () => {
+    const quote = await yf.quote(symbol);
+    return {
       symbol: quote.symbol,
       currency: quote.currency ?? null,
       price: quote.regularMarketPrice ?? null,
@@ -48,20 +47,18 @@ export async function getQuote(ticker: string) {
       fiftyTwoWeekHigh: quote.fiftyTwoWeekHigh ?? null,
       fiftyTwoWeekLow: quote.fiftyTwoWeekLow ?? null,
     };
-
-    return result;
   });
 }
 
-export async function getHistory(ticker: string, days: number = 30) {
+export async function getHistory(ticker: string, days = 30): Promise<MarketHistoryPoint[]> {
   const symbol = ticker.trim().toUpperCase();
-  const key = `${symbol}|${days}`;
-  return historyCache.getOrSet(key, async () => {
+  return historyCache.getOrSet(`${symbol}|${days}`, async () => {
     const endDate = new Date();
     const startDate = new Date();
     startDate.setDate(startDate.getDate() - days);
-    // chart() replaces historical(), which is deprecated in yahoo-finance2 v3
-    // (Yahoo shut down the underlying endpoint).
+
+    // chart() replaces historical(), deprecated in yahoo-finance2 v3 after
+    // Yahoo shut down the underlying endpoint.
     const result = await yf.chart(symbol, {
       period1: startDate,
       period2: endDate,

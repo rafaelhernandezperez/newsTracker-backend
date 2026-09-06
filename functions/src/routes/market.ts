@@ -1,7 +1,7 @@
 import { Router, type Request, type Response } from 'express';
 import { requireAuth } from '../middleware/auth';
 import { clampInt, requireValidTicker } from '../middleware/validation';
-import { getQuote, getHistory } from '../services/marketService/marketService.js';
+import { getQuote, getHistory } from '../services/marketService/marketService';
 
 const router = Router();
 
@@ -20,10 +20,7 @@ router.get('/:ticker', requireValidTicker, async (req: Request, res: Response) =
 
     const chart = history
       .filter((point) => point.close !== null)
-      .map((point) => ({
-        date: point.date,
-        value: point.close,
-      }));
+      .map((point) => ({ date: point.date, value: point.close }));
 
     return res.json({
       ok: true,

@@ -1,19 +1,14 @@
 import type { NextFunction, Request, Response } from "express";
 
 /**
- * Input validation for everything that crosses the API boundary.
+ * Input validation for everything crossing the API boundary. Two jobs, kept
+ * together so neither is forgotten:
  *
- * Two distinct jobs, deliberately kept together so neither is forgotten:
- *
- *  1. Reject values that are not plausibly what the caller claims (a ticker, a
- *     search phrase, an FCM token). This bounds the work each request can buy —
- *     outbound feed fetches, Yahoo lookups, LLM tokens — and it is the actual
- *     defence against abuse, since none of these values are ever interpolated
- *     into SQL or shell.
- *  2. Guarantee that any value used as a Firestore document id is a SINGLE path
- *     segment. `db.collection(c).doc(value)` splits `value` on "/", so an
- *     unvalidated id silently writes to a different depth of the tree than the
- *     code appears to target.
+ *  1. Reject values that are not plausibly what the caller claims, bounding the
+ *     work one request can buy (feed fetches, Yahoo lookups, LLM tokens).
+ *  2. Guarantee anything used as a Firestore document id is a SINGLE path
+ *     segment: `db.collection(c).doc(value)` splits `value` on "/", so an
+ *     unvalidated id silently writes to a different depth of the tree.
  */
 
 /** Firestore rejects these outright, or treats them as path traversal. */
@@ -21,7 +16,7 @@ const FIRESTORE_RESERVED = /^__.*__$/;
 
 /**
  * A single Firestore path segment: no "/", not "." or "..", not reserved, and
- * within Firestore's 1500-byte id limit (checked in bytes, not UTF-16 units).
+ * within Firestore's 1500-byte id limit (bytes, not UTF-16 units).
  */
 export function isSafeDocumentId(value: string): boolean {
   if (!value || value === "." || value === "..") return false;
@@ -31,25 +26,23 @@ export function isSafeDocumentId(value: string): boolean {
 }
 
 /**
- * Ticker symbols as the market data providers spell them. Covers plain symbols
- * (AAPL), share classes (BRK.B), exchange suffixes (BBVA.MC), indices (^GSPC),
- * FX pairs (EURUSD=X) and hyphenated classes (RDS-A) — and nothing else, so a
- * ticker can never carry a path separator or an LLM instruction.
- *
- * The caret is anchored to the front because that is the only place Yahoo uses
- * it (index prefix); allowing it anywhere would buy nothing and widen the set.
+ * Ticker symbols as the market data providers spell them: plain symbols (AAPL),
+ * share classes (BRK.B), exchange suffixes (BBVA.MC), indices (^GSPC), FX pairs
+ * (EURUSD=X) and hyphenated classes (RDS-A) — and nothing else, so a ticker can
+ * never carry a path separator or an LLM instruction. The caret is anchored to
+ * the front because that is the only place Yahoo uses it.
  */
 const TICKER_PATTERN = /^\^?[A-Z0-9][A-Z0-9.=-]{0,14}$/;
 
-export const MAX_COMPANY_NAME_LENGTH = 120;
-export const MAX_SEARCH_QUERY_LENGTH = 64;
+const MAX_COMPANY_NAME_LENGTH = 120;
+const MAX_SEARCH_QUERY_LENGTH = 64;
 /** FCM registration tokens are ~140-400 chars; the ceiling is slack, not a spec. */
 const MIN_DEVICE_TOKEN_LENGTH = 64;
 const MAX_DEVICE_TOKEN_LENGTH = 4096;
 const DEVICE_TOKEN_PATTERN = /^[A-Za-z0-9_:.-]+$/;
 
 /** Strip C0/C1 control characters, which no legitimate input here contains. */
-export function stripControlChars(value: string): string {
+function stripControlChars(value: string): string {
   // eslint-disable-next-line no-control-regex
   return value.replace(/[\u0000-\u001F\u007F-\u009F]/g, "");
 }
@@ -60,11 +53,10 @@ export function validateTicker(raw: unknown): Validated<string> {
   if (typeof raw !== "string") {
     return { ok: false, message: "ticker is required" };
   }
-  // Deliberately NOT stripped of control characters first: for a value this
-  // tightly specified, silently deleting bytes would turn "AAPL\0evil" into
-  // the valid-looking "AAPLEVIL" and hide the attempt. Free-text fields below
-  // are sanitized instead, because there a stray character is usually a paste
-  // artifact rather than an attack.
+  // Deliberately NOT stripped of control characters: for a value this tightly
+  // specified, deleting bytes would turn "AAPL\0evil" into a valid-looking
+  // "AAPLEVIL" and hide the attempt. Free-text fields below are sanitized
+  // instead, because there a stray character is usually a paste artifact.
   const ticker = raw.trim().toUpperCase();
   if (!TICKER_PATTERN.test(ticker) || !isSafeDocumentId(ticker)) {
     return {
@@ -141,9 +133,9 @@ export function validatePlatform(raw: unknown): Validated<string> {
 }
 
 /**
- * Coerce a query-string integer into [min, max], falling back to `fallback`
- * for anything absent or unparseable. Non-numeric input is never an error here:
- * these are display knobs, and a clamped default is friendlier than a 400.
+ * Coerce a query-string integer into [min, max], falling back for anything
+ * absent or unparseable. These are display knobs, so a clamped default is
+ * friendlier than a 400.
  */
 export function clampInt(
   raw: unknown,
@@ -169,10 +161,7 @@ export function validateLanguage(
   return { ok: true, value: raw as "en" | "es" };
 }
 
-/**
- * ISO-8601-ish date bound. Rejects anything Date cannot parse so a malformed
- * value can't silently become `Invalid Date` and disable range filtering.
- */
+/** ISO-8601-ish date bound, rejecting anything Date cannot parse. */
 export function validateDateInput(raw: unknown): Validated<string | undefined> {
   if (raw === undefined || raw === null || raw === "") {
     return { ok: true, value: undefined };
@@ -187,9 +176,8 @@ export function validateDateInput(raw: unknown): Validated<string | undefined> {
 }
 
 /**
- * Express middleware: validate `:ticker` once, at the edge, and hand the
- * canonical (uppercased, verified) form to handlers via `res.locals.ticker` so
- * no route re-derives it.
+ * Validate `:ticker` once, at the edge, and hand the canonical form to handlers
+ * via `res.locals.ticker` so no route re-derives it.
  */
 export function requireValidTicker(
   req: Request,

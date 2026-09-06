@@ -12,35 +12,35 @@ const NAME_SUFFIXES =
   /\b(inc|incorporated|corp|corporation|co|company|ltd|limited|plc|sa|s\.a\.|ag|nv|n\.v\.|holding|holdings|group|the)\b/gi;
 
 function buildAliases(ticker: string, companyName?: string): string[] {
-  const aliases = new Set<string>();
-  const cleanTicker = ticker.trim().toUpperCase();
-
-  aliases.add(cleanTicker);
+  const aliases = new Set<string>([ticker.trim().toUpperCase()]);
 
   if (companyName) {
     const name = companyName.trim();
     aliases.add(name);
 
     // "Apple Inc." -> "Apple"
-    const stripped = name.replace(NAME_SUFFIXES, '').replace(/[.,]/g, ' ').replace(/\s+/g, ' ').trim();
-    if (stripped && stripped.length >= 2) {
+    const stripped = name
+      .replace(NAME_SUFFIXES, '')
+      .replace(/[.,]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (stripped.length >= 2) {
       aliases.add(stripped);
     }
 
-    // First token of the stripped name ("Berkshire" from "Berkshire Hathaway")
+    // First token of the stripped name ("Berkshire" from "Berkshire Hathaway").
     const firstToken = stripped.split(' ')[0];
     if (firstToken && firstToken.length >= 4) {
       aliases.add(firstToken);
     }
   }
 
-  return Array.from(aliases).filter((a) => a && a.length >= 2);
+  return Array.from(aliases).filter((alias) => alias.length >= 2);
 }
 
 /**
- * Resolve a ticker to a full company profile, using yahoo-finance2 to look up
- * the real company name when the caller didn't supply one. This is what lets a
- * bare ticker (e.g. "AAPL") match "Apple" in a headline.
+ * Resolve a ticker to a company profile, looking up the real company name when
+ * the caller didn't supply one. This is what lets "AAPL" match "Apple".
  */
 export async function resolveCompanyProfile(
   ticker: string,

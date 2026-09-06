@@ -14,8 +14,7 @@ import {
 import { notifySubscribers } from "../notificationService/notificationService";
 import { getQuote } from "../marketService/marketService";
 
-// How far back the scheduler looks each run. Generous enough to survive a
-// missed run, while dedup prevents re-notifying on already-seen stories.
+// Generous enough to survive a missed run; dedup prevents re-notifying.
 const LOOKBACK_DAYS = 3;
 // Cap AI enrichment + notifications per ticker per run to bound cost/latency.
 const MAX_NEW_PER_TICKER = 5;
@@ -30,15 +29,11 @@ export type TrackerSummary = {
 };
 
 /**
- * One tracking cycle:
- *   1. Gather every watched ticker across all users.
- *   2. Fetch recent news per ticker.
- *   3. Keep only items not already stored (dedup by stable key).
- *   4. AI summarize + sentiment for the new ones.
- *   5. Persist. Routine items are NOT pushed (the daily digest covers them),
- *      but MUY_IMPORTANTE items go out immediately to subscribers who enabled
- *      the "High-impact news" alert preference. Pass `{ notify: true }` to
- *      force per-item push for everything (manual/debug use).
+ * One tracking cycle: gather every watched ticker, fetch recent news, keep the
+ * items not already stored, AI-enrich them and persist. Routine items are NOT
+ * pushed (the daily digest covers them) — only MUY_IMPORTANTE ones, and only to
+ * subscribers who enabled "High-impact news". `{ notify: true }` forces a
+ * per-item push for everything (manual/debug use).
  */
 export async function runTrackingCycle(
   options: { notify?: boolean } = {}
@@ -53,7 +48,7 @@ export async function runTrackingCycle(
   };
 
   // One batched prefs read for every subscriber in this cycle, so the per-item
-  // high-impact fan-out below never hits Firestore again.
+  // fan-out below never hits Firestore again.
   const prefsByUid = await getAlertPrefsForUsers(watched.flatMap((entry) => entry.subscribers));
 
   for (const entry of watched) {
@@ -75,13 +70,13 @@ async function processTicker(
   entry: WatchedTicker,
   notify: boolean,
   prefsByUid: Map<string, AlertPrefs>
-) {
+): Promise<{ candidates: number; newItems: number; notified: number }> {
   const news = await fetchNewsForTicker(entry.ticker, {
     companyName: entry.companyName,
     daysBack: LOOKBACK_DAYS,
     limit: 25,
-    // Stricter than the on-demand API: only push notifications for items that
-    // clearly name the company, not tangential market mentions.
+    // Stricter than the on-demand API: only notify on items that clearly name
+    // the company, not tangential market mentions.
     minScore: 4,
   });
 
@@ -97,12 +92,12 @@ async function processTicker(
   const newKeys = await filterNewNewsIds(Array.from(byKey.keys()));
   if (newKeys.size === 0) return result;
 
-  // Newest first, bounded per run.
+  // fetchNewsForTicker returns newest-first, so this keeps the freshest items.
   const fresh = Array.from(byKey.entries())
     .filter(([key]) => newKeys.has(key))
     .slice(0, MAX_NEW_PER_TICKER);
 
-  // One batched LLM call for the whole run's fresh items instead of one per item.
+  // One batched LLM call for the run's fresh items instead of one per item.
   const enrichments = await enrichNewsBatch(
     fresh.map(([, item]) => ({
       text: `${item.title}. ${item.summary ?? ""}`,
@@ -114,9 +109,9 @@ async function processTicker(
   for (const [index, [id, item]] of fresh.entries()) {
     const enrichment = enrichments[index];
 
-    // Enrichment failed (LLM unreachable, bad response…): skip persisting so
-    // the item is still "new" next cycle and gets retried — storing it now
-    // would freeze a fake NEUTRO classification forever.
+    // Enrichment failed (LLM unreachable, bad response…): skip persisting, so
+    // the item is still "new" next cycle and gets retried. Storing it now would
+    // freeze a fake NEUTRO classification forever.
     if (!enrichment) {
       console.warn(`[tracker] skipping ${entry.ticker} item (enrichment failed): ${item.title}`);
       continue;
@@ -141,8 +136,8 @@ async function processTicker(
     await saveNewsItem(stored);
     result.newItems += 1;
 
-    // `notify` forces per-item push to everyone (debug); otherwise only
-    // high-impact stories are pushed, and only to users who opted in.
+    // `notify` forces a per-item push to everyone (debug); otherwise only
+    // high-impact stories go out, and only to users who opted in.
     const recipients = notify
       ? entry.subscribers
       : enrichment.importance === "MUY_IMPORTANTE"
@@ -177,9 +172,8 @@ function madridDateKey(): string {
 }
 
 /**
- * "Big price moves" alert cycle: for every watched ticker, check the current
- * daily change and push one notification per ticker per day when it moves more
- * than ±3%, to the subscribers who enabled the preference. The Firestore
+ * "Big price moves": push one notification per ticker per day when it moves
+ * more than ±3%, to the subscribers who enabled the preference. The
  * `claimPriceAlert` doc makes the once-a-day guarantee hold across runs.
  */
 export async function runPriceAlertCycle(): Promise<PriceAlertSummary> {

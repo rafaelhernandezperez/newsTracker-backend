@@ -1,5 +1,5 @@
 import { fetchNewsForTicker } from "../newsService/newsService";
-import { stableNewsKey } from "../newsService/normalizers";
+import { stableNewsKey, toTimestamp } from "../newsService/normalizers";
 import {
   getUsersWithWatchlists,
   getRecentDigestNewsIds,
@@ -11,7 +11,7 @@ import type { NewsItem } from "../newsService/types";
 
 // The digest looks at the last day of coverage, matching its once-a-day cadence.
 const DIGEST_LOOKBACK_DAYS = 1;
-// How many items to pull per ticker before ranking; small, since we only keep one.
+// How many items to pull per ticker before ranking; small, since we keep one.
 const PER_TICKER_LIMIT = 5;
 // How many tickers to fetch/enrich concurrently.
 const FETCH_CONCURRENCY = 5;
@@ -33,26 +33,24 @@ function importanceRank(item: NewsItem): number {
   return item.importance ? IMPORTANCE_RANK[item.importance] ?? 1 : 1;
 }
 
-function publishedAtMs(item: NewsItem): number {
-  const ts = new Date(item.isoDate ?? item.pubDate ?? "").getTime();
-  return Number.isFinite(ts) ? ts : 0;
-}
-
 /**
- * Rank by AI importance first, then keyword relevance score, then recency. This
- * is what makes "the most relevant news across all the user's tickers" concrete:
- * a freshly listed/▲ high-impact story outranks routine coverage.
+ * Rank by AI importance, then keyword relevance, then recency. This is what
+ * makes "the most relevant news across the user's tickers" concrete: a
+ * high-impact story outranks routine coverage.
  */
 function isMoreRelevant(candidate: NewsItem, current: NewsItem): boolean {
-  const ri = importanceRank(candidate) - importanceRank(current);
-  if (ri !== 0) return ri > 0;
+  const byImportance = importanceRank(candidate) - importanceRank(current);
+  if (byImportance !== 0) return byImportance > 0;
   if (candidate.score !== current.score) return candidate.score > current.score;
-  return publishedAtMs(candidate) > publishedAtMs(current);
+  return (
+    toTimestamp(candidate.isoDate ?? candidate.pubDate) >
+    toTimestamp(current.isoDate ?? current.pubDate)
+  );
 }
 
 /**
- * Fetch + enrich each unique ticker ONCE, no matter how many users follow it.
- * Cost then scales with distinct tickers, not users × tickers.
+ * Fetch + enrich each unique ticker ONCE, however many users follow it, so cost
+ * scales with distinct tickers rather than users × tickers.
  */
 async function fetchNewsByTicker(
   tickers: Map<string, string | undefined>
@@ -82,17 +80,32 @@ async function fetchNewsByTicker(
   return result;
 }
 
+/** Collect unique tickers across users, keeping the first companyName seen. */
+function collectUniqueTickers(
+  users: { tickers: { ticker: string; companyName?: string }[] }[]
+): Map<string, string | undefined> {
+  const unique = new Map<string, string | undefined>();
+  for (const user of users) {
+    for (const { ticker, companyName } of user.tickers) {
+      if (!unique.has(ticker) || (!unique.get(ticker) && companyName)) {
+        unique.set(ticker, companyName);
+      }
+    }
+  }
+  return unique;
+}
+
 /**
  * One daily digest cycle: for every user, find the single most relevant story
  * across the tickers they follow and push exactly one notification. Skips users
- * with no fresh news or whose top story was sent in a recent digest.
+ * with no fresh news, or whose top story went out in a recent digest.
  */
 export async function runDailyDigestCycle(): Promise<DigestSummary> {
   const allUsers = await getUsersWithWatchlists();
   const summary: DigestSummary = { users: allUsers.length, notified: 0, skipped: 0 };
 
-  // Honor the onboarding "Daily digest" toggle: users who turned it off are
-  // skipped before any news is fetched on their behalf.
+  // Honor the onboarding "Daily digest" toggle before any news is fetched on a
+  // user's behalf.
   const prefsByUid = await getAlertPrefsForUsers(allUsers.map((user) => user.uid));
   const users = allUsers.filter((user) => {
     const wantsDigest = prefsByUid.get(user.uid)?.dailyDigest !== false;
@@ -100,17 +113,7 @@ export async function runDailyDigestCycle(): Promise<DigestSummary> {
     return wantsDigest;
   });
 
-  // Collect unique tickers across all users, keeping the first companyName seen.
-  const uniqueTickers = new Map<string, string | undefined>();
-  for (const user of users) {
-    for (const { ticker, companyName } of user.tickers) {
-      if (!uniqueTickers.has(ticker) || (!uniqueTickers.get(ticker) && companyName)) {
-        uniqueTickers.set(ticker, companyName);
-      }
-    }
-  }
-
-  const newsByTicker = await fetchNewsByTicker(uniqueTickers);
+  const newsByTicker = await fetchNewsByTicker(collectUniqueTickers(users));
 
   for (const user of users) {
     try {
@@ -122,8 +125,7 @@ export async function runDailyDigestCycle(): Promise<DigestSummary> {
       const recentIds = await getRecentDigestNewsIds(user.uid);
 
       // Rank EVERY fetched article across the user's tickers, skipping stories
-      // already sent to this user in a recent digest (not just the last one —
-      // yesterday's runner-up shouldn't become today's "news").
+      // already sent recently — yesterday's runner-up isn't today's news.
       let top: NewsItem | null = null;
       let topId: string | null = null;
       for (const { ticker } of user.tickers) {

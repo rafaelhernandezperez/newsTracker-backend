@@ -35,6 +35,20 @@ const NOISE_TERMS = [
   'solidaria', 'voluntariado', 'beca', 'becas', 'concierto', 'festival',
 ];
 
+/**
+ * Compiled once at module load: matching a term against every headline used to
+ * build a fresh RegExp per term per item.
+ */
+function compileTerm(term: string): (text: string) => boolean {
+  // Multi-word terms match as substrings; single words on word boundaries.
+  if (term.includes(' ')) return (text) => text.includes(term);
+  const pattern = new RegExp(`\\b${escapeRegExp(term)}\\b`, 'i');
+  return (text) => pattern.test(text);
+}
+
+const FINANCE_MATCHERS = FINANCE_TERMS.map(compileTerm);
+const NOISE_MATCHERS = NOISE_TERMS.map(compileTerm);
+
 export type FinancialSignal = {
   /** Net contribution to the relevance score (finance terms minus noise). */
   delta: number;
@@ -55,32 +69,27 @@ export function financialSignal(title: string, summary: string): FinancialSignal
   let financeHits = 0;
   let noise = 0;
 
-  const has = (text: string, term: string): boolean =>
-    term.includes(' ')
-      ? text.includes(term)
-      : new RegExp(`\\b${escapeRegExp(term)}\\b`, 'i').test(text);
-
-  for (const term of FINANCE_TERMS) {
-    if (has(normalizedTitle, term)) {
+  for (const matches of FINANCE_MATCHERS) {
+    if (matches(normalizedTitle)) {
       finance += 3;
       financeHits += 1;
-    } else if (has(normalizedSummary, term)) {
+    } else if (matches(normalizedSummary)) {
       finance += 1;
       financeHits += 1;
     }
   }
 
-  for (const term of NOISE_TERMS) {
-    if (has(normalizedTitle, term)) {
+  for (const matches of NOISE_MATCHERS) {
+    if (matches(normalizedTitle)) {
       noise += 4;
-    } else if (has(normalizedSummary, term)) {
+    } else if (matches(normalizedSummary)) {
       noise += 2;
     }
   }
 
   const delta = finance - noise;
-  // Require a real finance term AND a net-positive signal, so a sports/sponsorship
-  // penalty vetoes a weak/incidental finance match.
+  // Require a real finance term AND a net-positive signal, so a sponsorship
+  // penalty vetoes a weak or incidental finance match.
   return { delta, isFinancial: financeHits > 0 && delta > 0 };
 }
 
@@ -92,6 +101,7 @@ export function calculateRelevanceScore(
 ): number {
   const normalizedTitle = normalizeText(title);
   const normalizedSummary = normalizeText(summary);
+  const normalizedTicker = ticker.toLowerCase();
 
   let score = 0;
 
@@ -100,14 +110,10 @@ export function calculateRelevanceScore(
     if (!cleanAlias) continue;
 
     const regex = new RegExp(`\\b${escapeRegExp(cleanAlias)}\\b`, 'i');
+    const isTicker = cleanAlias === normalizedTicker;
 
-    if (regex.test(normalizedTitle)) {
-      score += cleanAlias === ticker.toLowerCase() ? 6 : 4;
-    }
-
-    if (regex.test(normalizedSummary)) {
-      score += cleanAlias === ticker.toLowerCase() ? 3 : 2;
-    }
+    if (regex.test(normalizedTitle)) score += isTicker ? 6 : 4;
+    if (regex.test(normalizedSummary)) score += isTicker ? 3 : 2;
   }
 
   return score;

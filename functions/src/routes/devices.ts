@@ -1,6 +1,6 @@
 // Device (FCM token) registration for push notifications.
 import { Router, type Request, type Response } from "express";
-import { requireAuth } from "../middleware/auth";
+import { getUid, requireAuth } from "../middleware/auth";
 import { validateDeviceToken, validatePlatform } from "../middleware/validation";
 import {
   registerDeviceToken,
@@ -10,10 +10,6 @@ import {
 const router = Router();
 
 router.use(requireAuth);
-
-function getUid(req: Request): string | undefined {
-  return (req as Request & { user?: { uid?: string } }).user?.uid;
-}
 
 // POST /devices  { token, platform }
 router.post("/", async (req: Request, res: Response) => {

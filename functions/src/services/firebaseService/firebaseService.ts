@@ -9,17 +9,12 @@ export const db = admin.firestore();
 export const auth = admin.auth();
 
 /**
- * Assert that a value is safe to use as a Firestore document id.
- *
- * `db.collection(c).doc(value)` treats "/" as a path separator, so an id like
- * `A/B/C` silently writes to a different depth of the tree than the call site
- * suggests. Routes already validate their inputs; this is the backstop for
- * every other caller — the scheduler, the digest, and any future code path —
- * because the Admin SDK bypasses Firestore security rules entirely, making this
- * layer the last place a malformed id can be caught.
- *
- * Throwing (rather than sanitising) is deliberate: a bad id here means a bug or
- * an attack upstream, and quietly rewriting it would hide both.
+ * Assert a value is safe to use as a Firestore document id. `doc(value)` treats
+ * "/" as a path separator, so an id like `A/B/C` silently writes to a different
+ * depth of the tree. Routes validate their own inputs; this is the backstop for
+ * every other caller, because the Admin SDK bypasses Firestore security rules.
+ * Throwing rather than sanitising is deliberate: a bad id means a bug or an
+ * attack upstream, and quietly rewriting it would hide both.
  */
 function assertDocumentId(value: string, label: string): string {
   if (!isSafeDocumentId(value)) {
@@ -53,7 +48,7 @@ export async function addTickerToWatchlist(
 export async function getUserWatchlist(uid: string): Promise<FirebaseFirestore.DocumentData[]> {
   const snap = await db
     .collection("users")
-    .doc(uid)
+    .doc(assertDocumentId(uid, "uid"))
     .collection("watchlist")
     .get();
 
@@ -69,9 +64,7 @@ export async function removeTickerFromWatchlist(uid: string, ticker: string): Pr
     .delete();
 }
 
-/* -------------------------------------------------------------------------- */
-/* Device tokens (FCM)                                                        */
-/* -------------------------------------------------------------------------- */
+/* -- Device tokens (FCM) -- */
 
 export async function registerDeviceToken(
   uid: string,
@@ -87,15 +80,13 @@ export async function registerDeviceToken(
     .collection("devices")
     .doc(safeToken);
 
-  // An FCM token identifies one browser/app installation, not one account.
-  // Reassign it when a shared browser changes accounts so the previous user
-  // cannot keep receiving alerts on this device. The frontend also unregisters
-  // on logout; this server-side cleanup covers crashes and missed logouts.
+  // An FCM token identifies one browser installation, not one account, so it is
+  // reassigned when a shared browser switches accounts — otherwise the previous
+  // user keeps receiving alerts on this device.
   //
-  // Keep a direct owner record instead of querying collectionGroup("devices"):
-  // that query needs a separately deployed collection-group index, and a
-  // missing index made every first-time browser registration fail with HTTP
-  // 500. The transaction also closes the account-switch race.
+  // The owner record is kept directly instead of querying collectionGroup
+  // ("devices"): that needs a separately deployed collection-group index, and a
+  // missing one made every first-time registration fail with a 500.
   await db.runTransaction(async (transaction) => {
     const owner = await transaction.get(ownerRef);
     const previousUid = owner.get("uid");
@@ -114,7 +105,7 @@ export async function registerDeviceToken(
       );
     } else if (previousUid !== undefined && previousUid !== safeUid) {
       // A corrupt owner record must not permanently block a legitimate browser
-      // from registering. Overwriting it below self-heals the canonical owner.
+      // from registering; overwriting it below self-heals the canonical owner.
       console.warn("[firebaseService] ignoring malformed device owner uid");
     }
 
@@ -186,9 +177,7 @@ export async function pruneInvalidTokens(tokens: string[]): Promise<void> {
   );
 }
 
-/* -------------------------------------------------------------------------- */
-/* Alert preferences                                                          */
-/* -------------------------------------------------------------------------- */
+/* -- Alert preferences -- */
 
 /** Which alert channels a user opted into (onboarding step 3). */
 export type AlertPrefs = {
@@ -200,19 +189,26 @@ export type AlertPrefs = {
   dailyDigest: boolean;
 };
 
-// Users who never saved preferences keep today's behavior: everything on.
+/** Users who never saved preferences keep today's behavior: everything on. */
 export const DEFAULT_ALERT_PREFS: AlertPrefs = {
   priceMoves: true,
   highImpact: true,
   dailyDigest: true,
 };
 
-function coerceAlertPrefs(raw: unknown): AlertPrefs {
+/**
+ * Read prefs from untrusted/partial data. Missing or malformed fields fall back
+ * to the defaults, so a partial write can't silently disable a channel.
+ */
+export function coerceAlertPrefs(raw: unknown): AlertPrefs {
   const data = (raw ?? {}) as Partial<Record<keyof AlertPrefs, unknown>>;
   return {
-    priceMoves: typeof data.priceMoves === "boolean" ? data.priceMoves : DEFAULT_ALERT_PREFS.priceMoves,
-    highImpact: typeof data.highImpact === "boolean" ? data.highImpact : DEFAULT_ALERT_PREFS.highImpact,
-    dailyDigest: typeof data.dailyDigest === "boolean" ? data.dailyDigest : DEFAULT_ALERT_PREFS.dailyDigest,
+    priceMoves:
+      typeof data.priceMoves === "boolean" ? data.priceMoves : DEFAULT_ALERT_PREFS.priceMoves,
+    highImpact:
+      typeof data.highImpact === "boolean" ? data.highImpact : DEFAULT_ALERT_PREFS.highImpact,
+    dailyDigest:
+      typeof data.dailyDigest === "boolean" ? data.dailyDigest : DEFAULT_ALERT_PREFS.dailyDigest,
   };
 }
 
@@ -264,9 +260,7 @@ export async function claimPriceAlert(ticker: string, dateKey: string): Promise<
   }
 }
 
-/* -------------------------------------------------------------------------- */
-/* Watchlist fan-out (cross-user)                                             */
-/* -------------------------------------------------------------------------- */
+/* -- Watchlist fan-out (cross-user) -- */
 
 export type WatchedTicker = {
   ticker: string;
@@ -276,8 +270,8 @@ export type WatchedTicker = {
 };
 
 /**
- * Collect every watched ticker across ALL users (collectionGroup), grouped so
- * the scheduler fetches news once per ticker and fans out to subscribers.
+ * Every watched ticker across ALL users, grouped so the scheduler fetches news
+ * once per ticker and fans out to its subscribers.
  */
 export async function getAllWatchedTickers(): Promise<WatchedTicker[]> {
   const snap = await db.collectionGroup("watchlist").get();
@@ -310,9 +304,8 @@ export type UserWatchlist = {
 };
 
 /**
- * Collect every user's watched tickers, grouped per user, for the per-user daily
- * digest. Only tickers with notifications enabled are included, so a user who
- * muted a ticker is never considered for it.
+ * Every user's watched tickers, grouped per user, for the daily digest. Muted
+ * tickers are excluded, so a user is never considered for one.
  */
 export async function getUsersWithWatchlists(): Promise<UserWatchlist[]> {
   const snap = await db.collectionGroup("watchlist").get();
@@ -337,9 +330,8 @@ export async function getUsersWithWatchlists(): Promise<UserWatchlist[]> {
 }
 
 /**
- * A small ring of the most recent news ids sent to a user in digests, so
- * yesterday's runner-up can't be pushed today as if it were fresh (a single
- * "last id" only guarded against exact repeats of the top story).
+ * A small ring of the most recent news ids sent to a user, so yesterday's
+ * runner-up can't be pushed today as if it were fresh.
  */
 const DIGEST_HISTORY_SIZE = 10;
 
@@ -367,9 +359,7 @@ export async function recordDigestNewsId(uid: string, newsId: string): Promise<v
   );
 }
 
-/* -------------------------------------------------------------------------- */
-/* News persistence + dedup                                                   */
-/* -------------------------------------------------------------------------- */
+/* -- News persistence + dedup -- */
 
 export type StoredNews = {
   id: string;
@@ -385,10 +375,6 @@ export type StoredNews = {
   pubDate?: string;
   isoDate?: string;
   score: number;
-};
-
-export type StoredNewsRecord = StoredNews & {
-  createdAt?: FirebaseFirestore.Timestamp;
 };
 
 /** Return the subset of ids that are NOT already stored (i.e. genuinely new). */
@@ -420,7 +406,7 @@ export async function getStoredNews(
 export async function saveNewsItem(item: StoredNews): Promise<void> {
   const { id, ...rest } = item;
   try {
-    // create() (not set/merge): the doc id is the dedup key, so a concurrent
+    // create(), not set/merge: the doc id is the dedup key, so a concurrent
     // scheduler run that stored it first must not clobber createdAt (which
     // orders the /stored feed) or re-write the enrichment.
     await db

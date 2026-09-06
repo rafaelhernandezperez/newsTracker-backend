@@ -1,13 +1,10 @@
 import axios, { AxiosError } from 'axios';
 
 const HUGGING_FACE_CHAT_URL = 'https://router.huggingface.co/v1/chat/completions';
-// Interactive pages should not remain blocked for the HTTP client's default
-// 45 seconds when the provider is slow.
+// Interactive pages should not stay blocked for the client's default 45s.
 const AI_REQUEST_TIMEOUT_MS = 20_000;
 
-/**
- * The only model: Qwen 3.5 4B via Featherless AI. Override with HF_MODEL.
- */
+/** The only model: Qwen 3.5 4B via Featherless AI. Override with HF_MODEL. */
 const DEFAULT_MODEL = 'Qwen/Qwen3.5-4B:featherless-ai';
 
 const SENTIMENT_VALUES = ['POSITIVO', 'NEGATIVO', 'NEUTRO'] as const;
@@ -30,11 +27,10 @@ type HuggingFaceChatResponse = {
 };
 
 /**
- * One accepted name per credential, deliberately. Accepting an alias as well
- * (this previously also read HUGGINGFACE_API_KEY) means a rotation has to find
- * and replace the secret in two places, and a stale value left in the other can
- * keep working unnoticed. HF_TOKEN is the name declared as a Firebase secret in
- * config/secrets.ts, so it is the single source of truth.
+ * One accepted name per credential, deliberately: accepting an alias too means
+ * a rotation has to find the secret in two places, and a stale value left in
+ * the other can keep working unnoticed. HF_TOKEN is the name declared as a
+ * Firebase secret in config/secrets.ts, so it is the single source of truth.
  */
 function getHuggingFaceToken(): string {
   const token = process.env.HF_TOKEN?.trim();
@@ -53,23 +49,6 @@ const RETRYABLE_NETWORK_CODES = new Set([
   'EAI_AGAIN',
   'ERR_NETWORK',
 ]);
-
-/**
- * One-line description of a failed model call: HTTP status plus whatever the
- * provider said. The raw axios error is thousands of lines of socket state, so
- * without this the actual cause (bad token, gated model, rate limit, TLS) never
- * makes it into the logs.
- */
-function describeError(error: unknown): string {
-  const axiosError = error as AxiosError<unknown>;
-  const status = axiosError?.response?.status;
-  const parts = [status ? `HTTP ${status}` : (axiosError?.code ?? 'no response')];
-
-  const provider = providerMessage(axiosError?.response?.data);
-  parts.push(provider ?? axiosError?.message ?? String(error));
-
-  return parts.join(' — ');
-}
 
 /** Pull the human-readable message out of the provider's error body. */
 function providerMessage(body: unknown): string | undefined {
@@ -94,6 +73,21 @@ function providerMessage(body: unknown): string | undefined {
 
   const message = (body as { message?: unknown }).message;
   return typeof message === 'string' ? message.slice(0, 300) : undefined;
+}
+
+/**
+ * One-line description of a failed model call. The raw axios error is thousands
+ * of lines of socket state, so without this the actual cause (bad token, gated
+ * model, rate limit, TLS) never makes it into the logs.
+ */
+function describeError(error: unknown): string {
+  const axiosError = error as AxiosError<unknown>;
+  const status = axiosError?.response?.status;
+  const parts = [status ? `HTTP ${status}` : (axiosError?.code ?? 'no response')];
+
+  parts.push(providerMessage(axiosError?.response?.data) ?? axiosError?.message ?? String(error));
+
+  return parts.join(' — ');
 }
 
 function isRetryable(error: unknown): boolean {
@@ -129,10 +123,9 @@ async function callModel(model: string, prompt: string, maxTokens: number): Prom
     stream: false,
   };
 
-  // Qwen 3.5 reasons by default. For short translation/classification work,
-  // thinking can consume the entire output allowance before JSON is emitted,
-  // adding latency and wasting the call. Featherless forwards this standard
-  // Qwen chat-template option to produce the answer directly.
+  // Qwen 3.5 reasons by default, and for short translation/classification work
+  // thinking can consume the whole output allowance before any JSON is emitted.
+  // Featherless forwards this standard Qwen option to answer directly.
   if (model.startsWith('Qwen/Qwen3.5-')) {
     requestBody.chat_template_kwargs = { enable_thinking: false };
   }
@@ -157,13 +150,11 @@ async function callModel(model: string, prompt: string, maxTokens: number): Prom
   return content;
 }
 
-/**
- * Run a prompt against the configured model with one retry on transient errors.
- */
 function configuredModel(): string {
   return process.env.HF_MODEL?.trim() || DEFAULT_MODEL;
 }
 
+/** Run a prompt against the configured model, retrying once on transient errors. */
 async function runPrompt(prompt: string, maxTokens: number): Promise<string> {
   const model = configuredModel();
 
@@ -188,31 +179,26 @@ async function runPrompt(prompt: string, maxTokens: number): Promise<string> {
 }
 
 /**
- * Longest text we will accept back from the model for a headline / summary. The
- * rubric asks for 25-45 words; anything far past that is a failed generation or
- * an injected payload, and it ends up in a push notification and a news card.
+ * Longest text we accept back from the model. The rubric asks for 25-45 words;
+ * far past that is a failed generation or an injected payload, and it ends up
+ * in a push notification and a news card.
  */
 const MAX_LOCALIZED_TITLE_LENGTH = 300;
 const MAX_SUMMARY_LENGTH = 700;
 
 /**
- * Neutralize prompt-injection attempts carried in feed content.
- *
- * Headlines and snippets come from Google News, Yahoo and Finnhub, so their
- * text is written by third parties — anyone able to get a post indexed can put
- * whatever they like in front of the model. Since the resulting summary is
- * stored, shown in the UI, and pushed to devices, a successful injection is a
- * content-forgery channel aimed at our own users.
- *
- * Defence is layered: strip the structural tokens an injection needs to break
- * out of its slot, then fence the remainder, and finally validate everything
- * the model returns (enum coercion, language check, length caps below).
+ * Neutralize prompt-injection attempts carried in feed content. Headlines come
+ * from third parties, and the resulting summary is stored, shown in the UI and
+ * pushed to devices — a successful injection is a content-forgery channel
+ * aimed at our own users. Defence is layered: strip the structural tokens an
+ * injection needs to break out of its slot, fence the remainder, then validate
+ * everything the model returns (enum coercion, language check, length caps).
  */
 function sanitizeSourceText(text: string): string {
   return (
     text
-      // Collapse all whitespace: newlines are what let injected text pose as a
-      // new prompt section rather than part of this item's headline.
+      // Collapse whitespace: newlines are what let injected text pose as a new
+      // prompt section rather than part of this item's headline.
       .replace(/\s+/g, ' ')
       // Chat-template role markers and common injection framing.
       .replace(/<\|[^|]*\|>/g, ' ')
@@ -220,7 +206,7 @@ function sanitizeSourceText(text: string): string {
       // Fence/JSON structure the model could mistake for the real schema.
       .replace(/[[\]{}]/g, ' ')
       .replace(/```/g, ' ')
-      // Our own delimiter, so source text cannot close its container early.
+      // Our own delimiters, so source text cannot close its container early.
       .replace(/SOURCE TEXT/gi, ' ')
       .replace(/TARGET OUTPUT LANGUAGE/gi, ' ')
       .replace(/\s{2,}/g, ' ')
@@ -256,22 +242,22 @@ function normalizeClassificationLabel(raw: string | undefined): string {
     .replace(/^_+|_+$/g, '');
 }
 
-/** Normalize a raw model string to one of the allowed enum values. */
+/**
+ * Normalize a raw model string to one of the allowed enum values. Models do not
+ * always preserve the requested separator, and "MUY IMPORTANTE" or
+ * "POCO-RELEVANTE" are valid semantic answers that must not become NEUTRO.
+ */
 function coerceEnum<T extends string>(
   raw: string | undefined,
   allowed: readonly T[],
   fallback: T
 ): T {
-  // Models do not always preserve the exact separator requested by the
-  // prompt. For example, "MUY IMPORTANTE" and "POCO-RELEVANTE" are valid
-  // semantic answers, but the previous implementation removed the separator
-  // entirely (MUYIMPORTANTE) and silently downgraded them to NEUTRO.
   const cleaned = normalizeClassificationLabel(raw);
   return (allowed as readonly string[]).includes(cleaned) ? (cleaned as T) : fallback;
 }
 
 /**
- * Explicit rubric so classifications are consistent run-to-run instead of
+ * Explicit rubric, so classifications are consistent run-to-run instead of
  * depending on the model's own notion of "important". IMPORTANCIA drives the
  * chart marker SIZE on the frontend; SENTIMIENTO drives its COLOR.
  */
@@ -305,77 +291,68 @@ const ENGLISH_LANGUAGE_MARKERS = new Set([
   'on', 'revenue', 'shares', 'stock', 'the', 'to', 'with',
 ]);
 
+function countMarkers(words: string[], markers: Set<string>): number {
+  return words.reduce((score, word) => score + (markers.has(word) ? 1 : 0), 0);
+}
+
 /**
- * Catch clear model failures where it ignored the requested translation
- * language. This deliberately requires a strong signal so company names and
- * short finance terms cannot cause a valid translation to be rejected.
+ * Catch clear failures where the model ignored the requested language. It
+ * deliberately requires a strong signal, so company names and short finance
+ * terms cannot get a valid translation rejected.
  */
 function isClearlyWrongLanguage(
   text: string,
   targetLanguage: 'en' | 'es',
   minimumWrongLanguageScore = 3
 ): boolean {
-  const words = text
-    .toLocaleLowerCase()
-    .match(/[\p{L}]+/gu) ?? [];
-  const spanishScore = words.reduce(
-    (score, word) => score + (SPANISH_LANGUAGE_MARKERS.has(word) ? 1 : 0),
-    0
-  );
-  const englishScore = words.reduce(
-    (score, word) => score + (ENGLISH_LANGUAGE_MARKERS.has(word) ? 1 : 0),
-    0
-  );
+  const words = text.toLocaleLowerCase().match(/[\p{L}]+/gu) ?? [];
+  const spanishScore = countMarkers(words, SPANISH_LANGUAGE_MARKERS);
+  const englishScore = countMarkers(words, ENGLISH_LANGUAGE_MARKERS);
 
   return targetLanguage === 'en'
     ? spanishScore >= minimumWrongLanguageScore && spanishScore >= englishScore + 2
     : englishScore >= minimumWrongLanguageScore && englishScore >= spanishScore + 2;
 }
 
-function parseEnrichment(
-  parsed: {
-    summary?: string;
-    localizedTitle?: string;
-    importancia?: string;
-    sentimiento?: string;
-    // Tolerate English keys in case the model ignores the schema.
-    importance?: string;
-    sentiment?: string;
-  },
-  fallbackSummary: string
-): NewsEnrichment {
+type ModelEnrichmentEntry = {
+  id?: number;
+  summary?: string;
+  localizedTitle?: string;
+  importancia?: string;
+  sentimiento?: string;
+  // Tolerate English keys in case the model ignores the schema.
+  importance?: string;
+  sentiment?: string;
+};
+
+function parseEnrichment(entry: ModelEnrichmentEntry, fallbackSummary: string): NewsEnrichment {
   return {
     // Cap what the model hands back: these strings go straight into news cards
-    // and push bodies, so an over-long generation is a UI and notification
-    // problem regardless of whether it was injected or merely a bad answer.
-    localizedTitle: parsed.localizedTitle?.trim().slice(0, MAX_LOCALIZED_TITLE_LENGTH) || '',
-    summary:
-      parsed.summary?.trim().slice(0, MAX_SUMMARY_LENGTH) || fallbackSummary,
-    importance: coerceEnum(parsed.importancia ?? parsed.importance, IMPORTANCE_VALUES, 'NEUTRO'),
-    sentiment: coerceEnum(parsed.sentimiento ?? parsed.sentiment, SENTIMENT_VALUES, 'NEUTRO'),
+    // and push bodies, so an over-long generation is a UI problem regardless of
+    // whether it was injected or merely a bad answer.
+    localizedTitle: entry.localizedTitle?.trim().slice(0, MAX_LOCALIZED_TITLE_LENGTH) || '',
+    summary: entry.summary?.trim().slice(0, MAX_SUMMARY_LENGTH) || fallbackSummary,
+    importance: coerceEnum(entry.importancia ?? entry.importance, IMPORTANCE_VALUES, 'NEUTRO'),
+    sentiment: coerceEnum(entry.sentimiento ?? entry.sentiment, SENTIMENT_VALUES, 'NEUTRO'),
   };
 }
 
-// How many news items to classify per LLM call. Keeps calls per request low
-// (40 items = 5 calls) without the response growing past max_tokens.
+// How many items to classify per LLM call. Keeps calls per request low without
+// the response growing past max_tokens.
 const BATCH_SIZE = 8;
-// Long chart ranges can contain several batches. Run a few concurrently so a
-// 30/40-item request does not pay the model latency four or five times in
-// sequence, while keeping provider pressure bounded.
+// Long chart ranges span several batches; run a few concurrently so a 40-item
+// request doesn't pay the model latency five times in sequence.
 const BATCH_CONCURRENCY = 3;
-
-// Token budget per item in a batch. A localized title plus a 25-45 word summary
-// in Spanish runs longer than in English; too small a budget truncates the JSON
-// array mid-answer, which used to discard the whole batch (no translated titles,
-// no classification) rather than just the tail.
+// Token budget per item. A localized title plus a 25-45 word summary runs longer
+// in Spanish; too small a budget truncates the JSON mid-array, which used to
+// discard the whole batch rather than just the tail.
 const MAX_TOKENS_PER_ITEM = 230;
 
 /**
- * Classify a batch of news items (summary + importance + sentiment) using ONE
- * LLM call per BATCH_SIZE items. Returns one entry per input, in order; items
- * in a failed chunk come back as null so callers can distinguish "the model
- * said NEUTRO" from "enrichment failed" — failed items must not be cached or
- * persisted as if classified, or they would never be retried.
+ * Classify a batch of news items using ONE LLM call per BATCH_SIZE items.
+ * Returns one entry per input, in order; items in a failed chunk come back as
+ * null so callers can tell "the model said NEUTRO" from "enrichment failed" —
+ * failed items must not be cached or persisted, or they'd never be retried.
  */
 export async function enrichNewsBatch(
   items: EnrichmentInput[]
@@ -404,16 +381,7 @@ function parseChunkResponse(
   const match = raw.match(/\[[\s\S]*\]/);
   if (!match) return null;
 
-  const parsed = JSON.parse(match[0]) as Array<{
-    id?: number;
-    summary?: string;
-    localizedTitle?: string;
-    importancia?: string;
-    sentimiento?: string;
-    importance?: string;
-    sentiment?: string;
-  }>;
-
+  const parsed = JSON.parse(match[0]) as ModelEnrichmentEntry[];
   if (!Array.isArray(parsed)) return null;
 
   return chunk.map((item, i) => {
@@ -439,7 +407,7 @@ function parseChunkResponse(
   });
 }
 
-async function enrichChunk(chunk: EnrichmentInput[]): Promise<Array<NewsEnrichment | null>> {
+function buildChunkPrompt(chunk: EnrichmentInput[]): string {
   const numbered = chunk
     .map((item, i) => {
       const language = item.targetLanguage === 'es' ? 'SPANISH' : 'ENGLISH';
@@ -453,25 +421,33 @@ async function enrichChunk(chunk: EnrichmentInput[]): Promise<Array<NewsEnrichme
   const targetLanguages = new Set(
     chunk.map((item) => (item.targetLanguage === 'es' ? 'SPANISH' : 'ENGLISH'))
   );
-  const languageDirective = targetLanguages.size === 1
-    ? `MANDATORY: Write every localizedTitle and summary ONLY in ${[...targetLanguages][0]}. ` +
-      'Translate source text that is in another language.\n'
-    : 'MANDATORY: Obey each item’s TARGET OUTPUT LANGUAGE independently. Translate as needed.\n';
+  const languageDirective =
+    targetLanguages.size === 1
+      ? `MANDATORY: Write every localizedTitle and summary ONLY in ${[...targetLanguages][0]}. ` +
+        'Translate source text that is in another language.\n'
+      : 'MANDATORY: Obey each item’s TARGET OUTPUT LANGUAGE independently. Translate as needed.\n';
 
+  return (
+    'Analyze and localize these financial news items.\n' +
+    languageDirective +
+    CLASSIFICATION_RUBRIC +
+    'Return ONLY a JSON array with one object per item, in the SAME order, ' +
+    'using this exact shape:\n' +
+    '[{"id": 1, "localizedTitle": "...", "summary": "...", ' +
+    '"importancia": "...", "sentimiento": "..."}, ...]\n\n' +
+    'News items:\n' +
+    numbered +
+    '\n\nFINAL LANGUAGE CHECK: localizedTitle and summary must use each item’s ' +
+    'TARGET OUTPUT LANGUAGE.'
+  );
+}
+
+async function enrichChunk(chunk: EnrichmentInput[]): Promise<Array<NewsEnrichment | null>> {
   try {
-    const prompt =
-      'Analyze and localize these financial news items.\n' +
-        languageDirective +
-        CLASSIFICATION_RUBRIC +
-        'Return ONLY a JSON array with one object per item, in the SAME order, ' +
-        'using this exact shape:\n' +
-        '[{"id": 1, "localizedTitle": "...", "summary": "...", ' +
-        '"importancia": "...", "sentimiento": "..."}, ...]\n\n' +
-        'News items:\n' +
-        numbered +
-        '\n\nFINAL LANGUAGE CHECK: localizedTitle and summary must use each item’s TARGET OUTPUT LANGUAGE.';
-    const maxTokens = MAX_TOKENS_PER_ITEM * chunk.length;
-    const response = await runPrompt(prompt, maxTokens);
+    const response = await runPrompt(
+      buildChunkPrompt(chunk),
+      MAX_TOKENS_PER_ITEM * chunk.length
+    );
     const results = parseChunkResponse(response, chunk);
 
     if (results) {
@@ -479,9 +455,8 @@ async function enrichChunk(chunk: EnrichmentInput[]): Promise<Array<NewsEnrichme
     }
     console.warn('[aiService] enrichChunk: response contained no JSON array');
   } catch (error) {
-    // Transport/auth/model failure: every attempt is already exhausted, and
-    // splitting the batch would only repeat it. Signal failure so callers skip
-    // caching and a later request retries.
+    // Transport/auth/model failure: retries are already exhausted, and splitting
+    // the batch would only repeat it. Signal failure so callers skip caching.
     console.warn(
       `[aiService] enrichChunk: model call failed for ${chunk.length} item(s) — ` +
         describeError(error)
@@ -489,10 +464,9 @@ async function enrichChunk(chunk: EnrichmentInput[]): Promise<Array<NewsEnrichme
     return chunk.map(() => null);
   }
 
-  // The model answered, but the JSON was unusable — typically truncated at
-  // max_tokens. Halve the batch and retry: a single bad response used to cost
-  // every item in it its translation and classification. Recursion bottoms out
-  // at one item, so the worst case loses only that item.
+  // The model answered but the JSON was unusable — typically truncated at
+  // max_tokens. Halve the batch and retry; recursion bottoms out at one item,
+  // so the worst case loses only that item rather than the whole chunk.
   if (chunk.length > 1) {
     const middle = Math.ceil(chunk.length / 2);
     console.warn(

@@ -1,4 +1,3 @@
-//GET /news/:ticker
 import { Router, type Request, type Response } from 'express';
 import { requireAuth } from '../middleware/auth';
 import {
@@ -15,22 +14,21 @@ const router = Router();
 
 router.use(requireAuth);
 
+/** Express parses repeated query params into arrays; take the first string. */
 function getQueryString(value: unknown): string | undefined {
   if (typeof value === 'string') {
     return value;
   }
-
   if (Array.isArray(value)) {
     return value.find((item): item is string => typeof item === 'string');
   }
-
   return undefined;
 }
 
 /** Only these windows are accepted; anything else is a client bug, not a range. */
 const ALLOWED_RANGES = new Set(['1D', '5D', '1W', '1M', '3M', '6M', '1Y']);
 
-// GET /news/:ticker/stored - AI-enriched news persisted by the tracker pipeline
+// GET /news/:ticker/stored — AI-enriched news persisted by the tracker pipeline.
 router.get('/:ticker/stored', requireValidTicker, async (req: Request, res: Response) => {
   try {
     const ticker = res.locals.ticker as string;
@@ -44,6 +42,7 @@ router.get('/:ticker/stored', requireValidTicker, async (req: Request, res: Resp
   }
 });
 
+// GET /news/:ticker — live news, optionally AI-enriched for the chart markers.
 router.get('/:ticker', requireValidTicker, async (req: Request, res: Response) => {
   try {
     const ticker = res.locals.ticker as string;
@@ -73,8 +72,7 @@ router.get('/:ticker', requireValidTicker, async (req: Request, res: Response) =
     const to = validateDateInput(getQueryString(req.query.to));
     if (!to.ok) return res.status(400).json({ ok: false, message: `to: ${to.message}` });
 
-    // 0 means "unset" here, and daysBack is separately capped to MAX_LOOKBACK_DAYS
-    // inside the news service.
+    // 0 means "unset"; daysBack is separately capped inside the news service.
     const daysBack =
       clampInt(getQueryString(req.query.daysBack), { min: 0, max: 365, fallback: 0 }) || undefined;
 
@@ -103,8 +101,6 @@ router.get('/:ticker', requireValidTicker, async (req: Request, res: Response) =
       to: to.value,
       daysBack,
       rssOnly,
-      // Attach AI importance + sentiment so the frontend chart can size/color
-      // its news markers. Cached per item, so repeat requests stay cheap.
       enrich,
       language: language.value,
       // Absent sourceLanguage means "no source-language filter", which is not
@@ -112,18 +108,10 @@ router.get('/:ticker', requireValidTicker, async (req: Request, res: Response) =
       sourceLanguage: rawSourceLanguage ? sourceLanguage.value : undefined,
     });
 
-    return res.json({
-      ok: true,
-      ticker,
-      count: news.length,
-      items: news,
-    });
+    return res.json({ ok: true, ticker, count: news.length, items: news });
   } catch (error) {
     console.error('[routes/news] Error:', error);
-    return res.status(500).json({
-      ok: false,
-      message: 'Error fetching news',
-    });
+    return res.status(500).json({ ok: false, message: 'Error fetching news' });
   }
 });
 
