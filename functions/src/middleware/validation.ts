@@ -47,7 +47,6 @@ export const MAX_SEARCH_QUERY_LENGTH = 64;
 const MIN_DEVICE_TOKEN_LENGTH = 64;
 const MAX_DEVICE_TOKEN_LENGTH = 4096;
 const DEVICE_TOKEN_PATTERN = /^[A-Za-z0-9_:.-]+$/;
-const PUSH_TEST_ID_PATTERN = /^[A-Za-z0-9_-]{16,80}$/;
 
 /** Strip C0/C1 control characters, which no legitimate input here contains. */
 export function stripControlChars(value: string): string {
@@ -139,17 +138,6 @@ export function validatePlatform(raw: unknown): Validated<string> {
     return { ok: false, message: "platform must be one of: web, android, ios" };
   }
   return { ok: true, value: platform };
-}
-
-/** Client-generated correlation id used to prove which test push came back. */
-export function validatePushTestId(raw: unknown): Validated<string> {
-  if (typeof raw !== "string" || !PUSH_TEST_ID_PATTERN.test(raw)) {
-    return {
-      ok: false,
-      message: "testId must be 16-80 characters using A-Z, a-z, 0-9, _ or - only",
-    };
-  }
-  return { ok: true, value: raw };
 }
 
 /**

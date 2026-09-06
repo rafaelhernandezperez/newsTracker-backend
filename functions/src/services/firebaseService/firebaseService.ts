@@ -391,11 +391,6 @@ export type StoredNewsRecord = StoredNews & {
   createdAt?: FirebaseFirestore.Timestamp;
 };
 
-export type PushTestNews = {
-  story: StoredNewsRecord;
-  companyName?: string;
-};
-
 /** Return the subset of ids that are NOT already stored (i.e. genuinely new). */
 export async function filterNewNewsIds(ids: string[]): Promise<Set<string>> {
   if (ids.length === 0) return new Set();
@@ -420,104 +415,6 @@ export async function getStoredNews(
     .limit(limit)
     .get();
   return snap.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
-}
-
-const PUSH_IMPORTANCE_RANK: Record<string, number> = {
-  MUY_IMPORTANTE: 4,
-  IMPORTANTE: 3,
-  NEUTRO: 2,
-  POCO_RELEVANTE: 1,
-};
-
-const COMPANY_SUFFIXES =
-  /\b(?:inc|incorporated|corp|corporation|co|company|ltd|limited|plc|sa|s\.a\.|ag|nv|n\.v\.|holdings?|group|the)\b/gi;
-
-function normalizeCompanyText(value: string): string {
-  return value
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-/** Reject a cached ticker assignment when the source never names that company. */
-function directlyNamesCompany(story: StoredNewsRecord, companyName?: string): boolean {
-  if (!companyName) return true;
-
-  const text = normalizeCompanyText(`${story.title} ${story.summary ?? ""}`);
-  const cleanName = normalizeCompanyText(companyName.replace(COMPANY_SUFFIXES, " "));
-  if (cleanName.length >= 4 && text.includes(cleanName)) return true;
-
-  // This catches headlines that use a shortened trading name ("Apple" rather
-  // than "Apple Inc.", "Disney" rather than "The Walt Disney Company").
-  const textWords = new Set(text.split(" "));
-  return cleanName
-    .split(" ")
-    .some((namePart) => namePart.length >= 5 && textWords.has(namePart));
-}
-
-function pushStoryQuality(story: StoredNewsRecord, recencyIndex: number): number {
-  const rawSummaryLength = String(story.summary ?? "").trim().length;
-  const importance = PUSH_IMPORTANCE_RANK[String(story.importance ?? "")] ?? 0;
-  const relevance = Number.isFinite(story.score) ? story.score : 0;
-
-  // Importance and source substance dominate. Recency only breaks close ties;
-  // the newest row is not automatically the strongest notification demo.
-  return importance * 10_000 + Math.min(rawSummaryLength, 2_000) + relevance * 10 - recencyIndex;
-}
-
-/**
- * Pick a showcase-quality real story for the authenticated user's push test.
- * A candidate must contain a substantive source snippet, because terse legacy
- * AI summaries cannot support a credible investor takeaway. Stories from the
- * user's watchlist are preferred and must directly name the watched company,
- * which prevents a weak ticker match from becoming a misleading notification.
- *
- * One bounded recent window avoids a composite-index dependency. Within that
- * window we rank impact, source substance, relevance and recency locally.
- */
-export async function getPushTestNews(uid: string): Promise<PushTestNews | null> {
-  const watchlist = await getUserWatchlist(assertDocumentId(uid, "uid"));
-  const watchedCompanies = new Map(
-    watchlist
-      .filter((item) => item.notificationsEnabled !== false)
-      .map((item) => [
-        String(item.ticker ?? "").trim().toUpperCase(),
-        String(item.companyName ?? "").trim() || undefined,
-      ] as const)
-      .filter(([ticker]) => isSafeDocumentId(ticker))
-  );
-
-  const recent = await db.collection("news").orderBy("createdAt", "desc").limit(250).get();
-  const stories = recent.docs.map(
-    (doc) => ({ id: doc.id, ...doc.data() }) as StoredNewsRecord
-  );
-  if (stories.length === 0) return null;
-
-  const candidates = stories
-    .map((story, recencyIndex) => {
-      const ticker = String(story.ticker ?? "").trim().toUpperCase();
-      const watched = watchedCompanies.has(ticker);
-      const companyName = watchedCompanies.get(ticker);
-      const hasSourceMaterial = String(story.summary ?? "").trim().length >= 120;
-      const validWatchedMatch = !watched || directlyNamesCompany(story, companyName);
-      return {
-        story,
-        companyName,
-        watched,
-        eligible: hasSourceMaterial && validWatchedMatch,
-        quality: pushStoryQuality(story, recencyIndex),
-      };
-    })
-    .filter((candidate) => candidate.eligible);
-
-  const pool = candidates.some((candidate) => candidate.watched)
-    ? candidates.filter((candidate) => candidate.watched)
-    : candidates;
-  const selected = pool.sort((a, b) => b.quality - a.quality)[0];
-  return selected ? { story: selected.story, companyName: selected.companyName } : null;
 }
 
 export async function saveNewsItem(item: StoredNews): Promise<void> {
