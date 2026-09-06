@@ -2,16 +2,13 @@ import axios, { AxiosError } from 'axios';
 
 const HUGGING_FACE_CHAT_URL = 'https://router.huggingface.co/v1/chat/completions';
 // Interactive pages should not remain blocked for the HTTP client's default
-// 45 seconds before trying the fallback model.
+// 45 seconds when the provider is slow.
 const AI_REQUEST_TIMEOUT_MS = 20_000;
 
 /**
- * Primary model: Qwen 3.5 4B via Featherless AI.
- * Override with HF_MODEL. If the primary is unavailable (404/403 for the model,
- * provider outage), the fallback is tried before giving up.
+ * The only model: Qwen 3.5 4B via Featherless AI. Override with HF_MODEL.
  */
 const DEFAULT_MODEL = 'Qwen/Qwen3.5-4B:featherless-ai';
-const FALLBACK_MODEL = 'meta-llama/Llama-3.1-8B-Instruct';
 
 const SENTIMENT_VALUES = ['POSITIVO', 'NEGATIVO', 'NEUTRO'] as const;
 const IMPORTANCE_VALUES = [
@@ -134,7 +131,7 @@ async function callModel(model: string, prompt: string, maxTokens: number): Prom
 
   // Qwen 3.5 reasons by default. For short translation/classification work,
   // thinking can consume the entire output allowance before JSON is emitted,
-  // adding latency and forcing a fallback. Featherless forwards this standard
+  // adding latency and wasting the call. Featherless forwards this standard
   // Qwen chat-template option to produce the answer directly.
   if (model.startsWith('Qwen/Qwen3.5-')) {
     requestBody.chat_template_kwargs = { enable_thinking: false };
@@ -161,38 +158,28 @@ async function callModel(model: string, prompt: string, maxTokens: number): Prom
 }
 
 /**
- * Run a prompt against the configured model with one retry on transient errors,
- * then against the fallback model before giving up.
+ * Run a prompt against the configured model with one retry on transient errors.
  */
-type ModelResponse = { content: string; model: string };
-
-function configuredModels(): string[] {
-  const primary = process.env.HF_MODEL?.trim() || DEFAULT_MODEL;
-  return primary === FALLBACK_MODEL ? [primary] : [primary, FALLBACK_MODEL];
+function configuredModel(): string {
+  return process.env.HF_MODEL?.trim() || DEFAULT_MODEL;
 }
 
-async function runPrompt(
-  prompt: string,
-  maxTokens: number,
-  models = configuredModels()
-): Promise<ModelResponse> {
+async function runPrompt(prompt: string, maxTokens: number): Promise<string> {
+  const model = configuredModel();
 
   let lastError: unknown;
-  for (const model of models) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        return { content: await callModel(model, prompt, maxTokens), model };
-      } catch (error) {
-        lastError = error;
-        console.warn(
-          `[aiService] ${model} attempt ${attempt + 1} failed: ${describeError(error)}`
-        );
-        if (!isRetryable(error)) break; // model/auth problem: skip to fallback model
-        // Back off only when another attempt will actually run. The old loop
-        // slept after its final failure before moving to the fallback model.
-        if (attempt < 1) {
-          await new Promise((resolve) => setTimeout(resolve, 1000));
-        }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      return await callModel(model, prompt, maxTokens);
+    } catch (error) {
+      lastError = error;
+      console.warn(
+        `[aiService] ${model} attempt ${attempt + 1} failed: ${describeError(error)}`
+      );
+      if (!isRetryable(error)) break; // model/auth problem: retrying cannot help
+      // Back off only when another attempt will actually run.
+      if (attempt < 1) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
       }
     }
   }
@@ -436,7 +423,7 @@ export async function generatePushNotificationCopy(
 
   try {
     const response = await runPrompt(prompt, 180);
-    const match = response.content.match(/\{[\s\S]*\}/);
+    const match = response.match(/\{[\s\S]*\}/);
     if (!match) return null;
     const parsed = JSON.parse(match[0]) as { body?: unknown };
     if (typeof parsed.body !== 'string') return null;
@@ -605,32 +592,16 @@ async function enrichChunk(chunk: EnrichmentInput[]): Promise<Array<NewsEnrichme
         '\n\nFINAL LANGUAGE CHECK: localizedTitle and summary must use each item’s TARGET OUTPUT LANGUAGE.';
     const maxTokens = MAX_TOKENS_PER_ITEM * chunk.length;
     const response = await runPrompt(prompt, maxTokens);
-    const primaryResults = parseChunkResponse(response.content, chunk);
+    const results = parseChunkResponse(response, chunk);
 
-    if (
-      primaryResults &&
-      (primaryResults.every((result) => result !== null) || response.model === FALLBACK_MODEL)
-    ) {
-      return primaryResults;
-    }
-
-    if (response.model !== FALLBACK_MODEL) {
-      // HTTP fallbacks alone are insufficient: a model can return malformed
-      // JSON or valid JSON in the wrong language. Retry invalid entries using
-      // Llama, while retaining any valid Qwen results.
-      const fallbackResponse = await runPrompt(prompt, maxTokens, [FALLBACK_MODEL]);
-      const fallbackResults = parseChunkResponse(fallbackResponse.content, chunk);
-      if (fallbackResults) {
-        return primaryResults
-          ? primaryResults.map((result, index) => result ?? fallbackResults[index])
-          : fallbackResults;
-      }
+    if (results) {
+      return results;
     }
     console.warn('[aiService] enrichChunk: response contained no JSON array');
   } catch (error) {
-    // Transport/auth/model failure: every attempt and both models are already
-    // exhausted, and splitting the batch would only repeat it. Signal failure so
-    // callers skip caching and a later request retries.
+    // Transport/auth/model failure: every attempt is already exhausted, and
+    // splitting the batch would only repeat it. Signal failure so callers skip
+    // caching and a later request retries.
     console.warn(
       `[aiService] enrichChunk: model call failed for ${chunk.length} item(s) — ` +
         describeError(error)
