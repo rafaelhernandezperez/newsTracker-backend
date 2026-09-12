@@ -3,6 +3,8 @@ import axios, { AxiosError } from 'axios';
 const HUGGING_FACE_CHAT_URL = 'https://router.huggingface.co/v1/chat/completions';
 // Interactive pages should not stay blocked for the client's default 45s.
 const AI_REQUEST_TIMEOUT_MS = 20_000;
+/** Hard ceiling on a model response body. See the call site for why. */
+const MAX_AI_RESPONSE_BYTES = 2 * 1024 * 1024;
 
 /** The only model: Qwen 3.5 4B via Featherless AI. Override with HF_MODEL. */
 const DEFAULT_MODEL = 'Qwen/Qwen3.5-4B:featherless-ai';
@@ -139,6 +141,12 @@ async function callModel(model: string, prompt: string, maxTokens: number): Prom
         'Content-Type': 'application/json',
       },
       timeout: AI_REQUEST_TIMEOUT_MS,
+      // A classification response is a few hundred bytes. The cap exists so a
+      // provider fault (or a compromised endpoint) cannot stream an unbounded
+      // body into the function's memory.
+      maxContentLength: MAX_AI_RESPONSE_BYTES,
+      maxBodyLength: MAX_AI_RESPONSE_BYTES,
+      maxRedirects: 0,
     }
   );
 

@@ -9,15 +9,41 @@ import { TtlCache } from './cache';
 import { enrichNewsBatch } from '../aiService/aiService';
 import type { CompanyProfile, NewsItem } from './types';
 
-const parser = new Parser({
-  // One stalled feed must not hold an interactive request for 12 seconds; the
-  // other sources still provide coverage when this bounded call times out.
-  timeout: 7000,
-  headers: {
-    'User-Agent':
-      'Mozilla/5.0 (compatible; financial-news-tracker/2.0; +https://example.com/bot)',
-  },
-});
+/**
+ * Feeds run to tens of KB, so 2 MB is slack rather than a spec. `rss-parser`
+ * has no size limit of its own: left to `parseURL`, a hostile or simply broken
+ * feed can stream an unbounded body into a 512MiB function until it OOMs.
+ * Fetching with axios and handing only the text to the parser caps what any one
+ * source can cost us.
+ */
+const MAX_FEED_BYTES = 2 * 1024 * 1024;
+/**
+ * One stalled feed must not hold an interactive request for 12 seconds; the
+ * other sources still provide coverage when this bounded call times out.
+ */
+const FEED_TIMEOUT_MS = 7000;
+const FEED_USER_AGENT =
+  'Mozilla/5.0 (compatible; financial-news-tracker/2.0; +https://example.com/bot)';
+
+const parser = new Parser();
+
+/** Size- and time-bounded stand-in for `parser.parseURL`. */
+async function parseFeed(url: string) {
+  const response = await axios.get<string>(url, {
+    timeout: FEED_TIMEOUT_MS,
+    responseType: 'text',
+    // Feeds are XML; stop axios from trying to JSON-parse the body first.
+    transformResponse: [(body: string) => body],
+    maxContentLength: MAX_FEED_BYTES,
+    maxBodyLength: MAX_FEED_BYTES,
+    // A feed that needs more than a few hops is redirecting us somewhere we
+    // did not ask to go.
+    maxRedirects: 3,
+    headers: { 'User-Agent': FEED_USER_AGENT },
+  });
+
+  return parser.parseString(response.data);
+}
 
 const yf = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
 
@@ -337,7 +363,7 @@ async function fetchFromQuerySources(profile: CompanyProfile): Promise<NewsItem[
   const results = await Promise.all(
     QUERY_SOURCES.map(async (source) => {
       try {
-        const feed = await parser.parseURL(source.build(profile));
+        const feed = await parseFeed(source.build(profile));
         return mapFeedItems(
           feed.items ?? [],
           profile,
@@ -444,6 +470,9 @@ async function fetchFinnhubNews(
       const response = await axios.get<FinnhubArticle[]>(FINNHUB_COMPANY_NEWS_URL, {
         params: { symbol: profile.ticker, from: toYmd(from), to: toYmd(to), token },
         timeout: 12000,
+        maxContentLength: MAX_FEED_BYTES,
+        maxBodyLength: MAX_FEED_BYTES,
+        maxRedirects: 3,
       });
 
       const articles = Array.isArray(response.data) ? response.data : [];
@@ -514,7 +543,7 @@ async function fetchHistoricalGoogleNews(
               toYmd(windowFrom),
               toYmd(windowTo)
             );
-            const feed = await parser.parseURL(url);
+            const feed = await parseFeed(url);
             return mapFeedItems(feed.items ?? [], profile, edition.name, edition.language, true);
           } catch (error) {
             console.error(
