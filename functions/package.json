@@ -34,5 +34,8 @@
     "firebase-functions-test": "^3.4.1",
     "typescript": "^6.0.0"
   },
-  "private": true
+  "private": true,
+  "overrides": {
+    "qs": "^6.16.0"
+  }
 }
