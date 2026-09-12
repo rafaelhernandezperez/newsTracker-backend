@@ -2,8 +2,7 @@
 
 Serverless API and background pipeline behind **NewsTracker**, a financial news tracker that
 watches a user's portfolio, pulls company news from public feeds, classifies it with an LLM
-(sentiment + importance, EN/ES), stores it, and pushes only what matters — high-impact stories,
->3% price moves, and one daily digest.
+(sentiment + importance, EN/ES), stores it, and pushes only what matters — high-impact stories, 3% price moves, and one daily digest.
 
 Firebase Cloud Functions v2 · TypeScript · Express · Firestore · Cloud Messaging · Cloud Scheduler.
 
