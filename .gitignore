@@ -20,3 +20,5 @@ ai-evaluation.log
 
 # Thesis drafts and internal docs — local only, never pushed
 docs/
+# Local agent/editor state
+.claude/settings.local.json
