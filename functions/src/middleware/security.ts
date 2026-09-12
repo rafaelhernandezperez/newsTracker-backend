@@ -34,7 +34,9 @@ export const corsOptions: CorsOptions = {
     return callback(null, allowedOrigins().includes(origin));
   },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Authorization", "Content-Type"],
+  // X-Firebase-AppCheck must be listed or the browser's preflight rejects
+  // every attested request before it is ever sent.
+  allowedHeaders: ["Authorization", "Content-Type", "X-Firebase-AppCheck"],
   // The API is stateless and token-authenticated; it never reads cookies.
   credentials: false,
   maxAge: 3600,
