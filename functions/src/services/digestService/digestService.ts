@@ -161,7 +161,9 @@ export async function runDailyDigestCycle(): Promise<DigestSummary> {
         summary.skipped += 1;
       }
     } catch (error) {
-      console.error(`[digest] Failed processing user ${user.uid}:`, error);
+      // Never log the uid: it is personal data and logs outlive the cycle.
+      // The error itself is what makes a failed digest actionable.
+      console.error("[digest] failed processing one user:", error);
     }
   }
 
