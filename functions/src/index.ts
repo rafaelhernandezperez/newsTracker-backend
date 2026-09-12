@@ -9,6 +9,7 @@ import watchlistRouter from "./routes/watchlist.js";
 import devicesRouter from "./routes/devices.js";
 import preferencesRouter from "./routes/preferences.js";
 import { requireAuth } from "./middleware/auth.js";
+import { verifyAppCheck } from "./middleware/appCheck.js";
 import { corsOptions, securityHeaders } from "./middleware/security.js";
 import { limits } from "./middleware/rateLimit.js";
 import { hfToken } from "./config/secrets.js";
@@ -44,6 +45,11 @@ app.use(express.json({ limit: "16kb" }));
 // Backstop, mounted before auth so an unauthenticated flood is rejected without
 // reaching token verification. Per-route limiters below add cost-aware tiers.
 app.use(limits.global);
+
+// Attestation runs before identity: "is this our app?" is cheaper to answer
+// than "who is this?", and rejecting a scripted caller here saves the Identity
+// Toolkit round trip. Monitoring-only until APP_CHECK_ENFORCED=true.
+app.use(verifyAppCheck);
 
 // /news triggers paid LLM calls, so no route is public. Auth is re-applied
 // inside each router, so one can never be mounted without it by accident.

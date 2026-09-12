@@ -7,6 +7,7 @@ if (!admin.apps.length) {
 
 export const db = admin.firestore();
 export const auth = admin.auth();
+export const appCheck = admin.appCheck();
 
 /**
  * Assert a value is safe to use as a Firestore document id. `doc(value)` treats
